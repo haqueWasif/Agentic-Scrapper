@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import shutil
 from typing import Any
+import warnings
 
 from pypdf import PdfReader
 
@@ -16,6 +17,49 @@ DEFAULT_MAX_PREVIEW_PAGES = 10
 DEFAULT_MIN_PREVIEW_CHARACTERS = 2500
 DEFAULT_MAX_PREVIEW_CHARACTERS = 12000
 MIN_USEFUL_PAGE_CHARACTERS = 80
+MINIMUM_PDF_BYTES = 128
+
+
+def check_pdf_integrity(file_path: Path, *, minimum_size: int = MINIMUM_PDF_BYTES) -> dict[str, Any]:
+    """Perform the bounded technical gate required before semantic Stage 2 work.
+
+    It reads only the signature and PDF cross-reference/page metadata.  It does
+    not extract page text and never calls an LLM.
+    """
+    try:
+        if not file_path.is_file():
+            return {"valid": False, "error_type": "PDF_MISSING", "error_message": "file does not exist", "size": 0, "page_count": 0}
+        size = file_path.stat().st_size
+    except OSError as exc:
+        return {"valid": False, "error_type": "PDF_PARSE_ERROR", "error_message": str(exc)[:240], "size": 0, "page_count": 0}
+    if size == 0:
+        return {"valid": False, "error_type": "EMPTY_PDF", "error_message": "file is zero bytes", "size": size, "page_count": 0}
+    if size < max(1, int(minimum_size)):
+        return {"valid": False, "error_type": "PDF_TRUNCATED", "error_message": f"file is only {size} bytes", "size": size, "page_count": 0}
+    try:
+        with file_path.open("rb") as source:
+            signature = source.read(8)
+            if not signature.startswith(b"%PDF-"):
+                return {
+                    "valid": False, "error_type": "INVALID_PDF_HEADER",
+                    "error_message": f"expected %PDF- signature, found {signature[:8]!r}", "size": size, "page_count": 0,
+                }
+            source.seek(0)
+            # PyPDF may issue recoverable warnings for malformed input.  This
+            # gate is intentionally strict: unreadable files do not proceed to
+            # the semantic Stage 2 workflow.
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                reader = PdfReader(source, strict=True)
+                page_count = len(reader.pages)
+    except Exception as exc:
+        message = str(exc)[:240]
+        lowered = message.lower()
+        error_type = "PDF_TRUNCATED" if any(marker in lowered for marker in ("eof", "startxref", "truncated")) else "PDF_PARSE_ERROR"
+        return {"valid": False, "error_type": error_type, "error_message": message, "size": size, "page_count": 0}
+    if page_count < 1:
+        return {"valid": False, "error_type": "ZERO_PAGE_PDF", "error_message": "PDF contains no pages", "size": size, "page_count": 0}
+    return {"valid": True, "error_type": None, "error_message": None, "size": size, "page_count": page_count}
 
 def validation_directories(data_directory: Path) -> dict[str, Path]:
     """Create the three explicit Stage 2 storage destinations."""

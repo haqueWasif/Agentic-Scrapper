@@ -227,6 +227,10 @@ class GlobalRecoveryBacklog:
             del self._jobs[key]
         return jobs
 
+    def snapshot(self) -> list[dict[str, Any]]:
+        """Return a display-only copy; callers cannot mutate scheduler jobs."""
+        return [dict(candidate) for candidate in self._jobs.values()]
+
     def __bool__(self) -> bool:
         return bool(self._jobs)
 

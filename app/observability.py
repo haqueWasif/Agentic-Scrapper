@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import os
-import sys
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, TypeVar
@@ -61,7 +60,6 @@ def trace_operation(
     if not settings.enabled:
         return operation()
 
-    span = None
     try:
         from langsmith import Client
         from langsmith.run_helpers import trace
@@ -71,7 +69,7 @@ def trace_operation(
             workspace_id=settings.workspace_id,
             auto_batch_tracing=True,
         )
-        span = trace(
+        trace_context = trace(
             name,
             run_type="chain",
             inputs=inputs,
@@ -82,34 +80,46 @@ def trace_operation(
             exceptions_to_handle=(Exception,),
             client=client,
         )
-        span.__enter__()
     except Exception as exc:
         _LOGGER.warning("LangSmith tracing unavailable for %s: %s", name, type(exc).__name__)
         return operation()
 
     started = time.monotonic()
+    result: T | None = None
+    operation_error: BaseException | None = None
+    operation_completed = False
     try:
-        result = operation()
-    except BaseException as exc:
-        try:
-            span.end(outputs={
-                "error_status": True,
-                "error_type": type(exc).__name__,
-                "duration_seconds": round(time.monotonic() - started, 3),
-            })
-        except Exception as trace_exc:
-            _LOGGER.warning("LangSmith trace finalization unavailable for %s: %s", name, type(trace_exc).__name__)
-        raise
-    else:
-        try:
-            outputs = dict(summarize_output(result))
-            outputs["duration_seconds"] = round(time.monotonic() - started, 3)
-            span.end(outputs=outputs)
-        except Exception as trace_exc:
-            _LOGGER.warning("LangSmith trace finalization unavailable for %s: %s", name, type(trace_exc).__name__)
-        return result
-    finally:
-        try:
-            span.__exit__(*sys.exc_info())
-        except Exception as trace_exc:
+        # ``trace`` is a context manager.  Its entered object is the actual
+        # LangSmith run and is the only object guaranteed to expose ``end``.
+        with trace_context as run:
+            try:
+                result = operation()
+                operation_completed = True
+            except BaseException as exc:
+                operation_error = exc
+                try:
+                    run.end(outputs={
+                        "error_status": True,
+                        "error_type": type(exc).__name__,
+                        "duration_seconds": round(time.monotonic() - started, 3),
+                    })
+                except Exception as trace_exc:
+                    _LOGGER.warning("LangSmith trace finalization unavailable for %s: %s", name, type(trace_exc).__name__)
+            else:
+                try:
+                    outputs = dict(summarize_output(result))
+                    outputs["duration_seconds"] = round(time.monotonic() - started, 3)
+                    run.end(outputs=outputs)
+                except Exception as trace_exc:
+                    _LOGGER.warning("LangSmith trace finalization unavailable for %s: %s", name, type(trace_exc).__name__)
+    except Exception as trace_exc:
+        if operation_error is not None:
+            raise operation_error
+        if operation_completed:
             _LOGGER.warning("LangSmith trace close unavailable for %s: %s", name, type(trace_exc).__name__)
+            return result
+        _LOGGER.warning("LangSmith tracing unavailable for %s: %s", name, type(trace_exc).__name__)
+        return operation()
+    if operation_error is not None:
+        raise operation_error
+    return result  # type: ignore[return-value]

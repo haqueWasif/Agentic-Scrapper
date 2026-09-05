@@ -48,12 +48,18 @@ def lifecycle_view(entry: dict[str, Any], *, status: str, candidate: dict[str, A
     final_status = (
         "ACCEPTED" if stage2_status == "APPROVED" else
         "REJECTED" if stage2_status == "REJECTED" else
+        "PDF_INVALID" if stage2_status == "PDF_INVALID" else
         "STAGE1_REJECTED" if stage1_status == "REJECTED" else
         "DOWNLOAD_FAILED" if normalized == "PERMANENTLY_FAILED" else
         "IN_PROGRESS"
     )
     return {
-        "discovery": {**previous_discovery, "status": previous_discovery.get("status", "DISCOVERED")},
+        "discovery": {
+            **previous_discovery,
+            "status": previous_discovery.get("status", "DISCOVERED"),
+            "source_page": candidate.get("source_page", previous_discovery.get("source_page")),
+            "source_item": candidate.get("source_item", previous_discovery.get("source_item")),
+        },
         "stage1": {
             **previous_stage1,
             "status": stage1_status,
@@ -71,7 +77,8 @@ def lifecycle_view(entry: dict[str, Any], *, status: str, candidate: dict[str, A
         "stage2": {
             **previous_stage2,
             "status": str(stage2_status).upper(),
-            "completed": str(stage2_status).upper() in {"APPROVED", "REJECTED"},
+            "completed": str(stage2_status).upper() in {"APPROVED", "REJECTED", "PDF_INVALID"},
+            "technical_error": entry.get("technical_error", previous_stage2.get("technical_error")),
         },
         "final_status": final_status,
     }

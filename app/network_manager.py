@@ -102,7 +102,11 @@ class NetworkManager:
             proxy = self._select_proxy()
         if delay:
             time.sleep(delay)
-        self.emit("status", worker, filename, f"Network Status: Provider: curl_cffi · Worker: {worker}/{self.settings.max_workers} · Proxy: {proxy or 'disabled'}")
+        self.emit(
+            "status", worker, filename,
+            f"Network Status: Provider: curl_cffi · Worker: {worker}/{self.settings.max_workers} · Proxy: {proxy or 'disabled'}",
+            level="DEBUG", category="network",
+        )
         return proxy
 
     def _select_proxy(self) -> str | None:
@@ -161,7 +165,10 @@ class NetworkManager:
             time.sleep(min(5 * (2 ** max(0, attempt - 1)), 40))
 
     def emit(self, kind: str, worker: int, filename: str, message: str = "", **extra: Any) -> None:
-        self.events.put({"kind": kind, "worker": worker, "filename": filename, "message": message, **extra})
+        self.events.put({
+            "kind": kind, "worker": worker, "filename": filename, "message": message,
+            "timestamp": time.time(), **extra,
+        })
 
     def close(self) -> None:
         with self._lock:

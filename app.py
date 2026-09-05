@@ -1,6 +1,7 @@
 """Streamlit entry point for the complete ASHRAE scraping pipeline."""
 
 import asyncio
+from collections import deque
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import contextmanager, nullcontext
 import hashlib
@@ -30,10 +31,11 @@ from pypdf import PdfReader
 from app.agents.orchestrator import invoke_pdf_validation_graph, invoke_scraper_graph
 from app.network_manager import NetworkManager
 from app.observability import langsmith_status
-from app.pipeline_events import PipelineEventBus, RunMetrics
+from app.pipeline_events import DownloadPresentation, PipelineEventBus, RunMetrics
 from app.pipeline_scheduler import BoundedWorkQueue, DownloadOutcome, GlobalDownloadQueue, GlobalRecoveryBacklog
 from app.pipeline_state import lifecycle_view, stable_document_id
 from app.pdf_validation import (
+    check_pdf_integrity,
     completed_validation_report,
     extract_pdf_preview,
     scan_existing_pdfs,
@@ -128,6 +130,24 @@ def _safe_pdf_filename(title: str, page_number: int, item_number: int) -> str:
     clean_title = re.sub(r"[^A-Za-z0-9._ -]+", "_", title).strip(" ._")
     clean_title = re.sub(r"\s+", "_", clean_title)[:100] or "document"
     return f"page_{page_number:03d}_{item_number:03d}_{clean_title}.pdf"
+
+
+def _candidate_provenance(candidate: dict[str, Any]) -> tuple[int | None, int | None]:
+    """Return source page/item metadata, including a safe legacy filename fallback."""
+    try:
+        page = int(candidate.get("source_page"))
+        item = int(candidate.get("source_item"))
+        if page > 0 and item > 0:
+            return page, item
+    except (TypeError, ValueError):
+        pass
+    match = re.match(r"page_(\d{3})_(\d{3})_", str(candidate.get("filename") or ""), re.IGNORECASE)
+    return (int(match.group(1)), int(match.group(2))) if match else (None, None)
+
+
+def _candidate_provenance_label(candidate: dict[str, Any]) -> str:
+    page, item = _candidate_provenance(candidate)
+    return f"source page {page} · item {item}" if page is not None and item is not None else "source page unavailable"
 
 
 def _extract_search_mirror_rows(html: str, search_url: str) -> list[dict[str, list[str]]]:
@@ -406,6 +426,8 @@ def _update_download_state(
     completed: bool | None = None,
     retry_after_seconds: float | None = None,
     validation_status: str | None = None,
+    technical_error_type: str | None = None,
+    technical_error_message: str | None = None,
 ) -> bool:
     """Atomically record transfer and round-recovery state for one document."""
     with _DOWNLOAD_STATE_LOCK:
@@ -436,6 +458,7 @@ def _update_download_state(
                 entry["document_id"] = str(candidate.get("document_id") or filename)
                 entry["title"] = str(candidate.get("title") or entry.get("title") or filename)
                 entry["query"] = str(candidate.get("query") or entry.get("query") or "")
+                entry["run_id"] = str(candidate.get("run_id") or entry.get("run_id") or "")
             if document_attempt is not None:
                 entry["document_attempt"] = int(document_attempt)
             if request_attempt is not None:
@@ -452,6 +475,14 @@ def _update_download_state(
                 entry.pop("retry_after_until", None)
             if validation_status is not None:
                 entry["validation_status"] = validation_status
+            if technical_error_type:
+                entry["technical_error"] = {
+                    "error_type": str(technical_error_type)[:80],
+                    "error_message": str(technical_error_message or "")[:240],
+                    "timestamp": int(time.time()),
+                }
+                entry["error_type"] = entry["technical_error"]["error_type"]
+                entry["error_message"] = entry["technical_error"]["error_message"]
             if reason:
                 entry["reason"] = reason
                 entry["last_error"] = reason
@@ -611,7 +642,9 @@ def log_status(message: str, on_status=None) -> None:
     logging.getLogger(__name__).info("download: %s", message)
     if threading.current_thread() is threading.main_thread():
         try:
-            st.session_state.setdefault("_download_debug", []).append(message)
+            history = st.session_state.setdefault("_download_debug", [])
+            history.append(message)
+            del history[:-500]
         except Exception:
             pass
     if on_status:
@@ -905,7 +938,7 @@ def _check_download_relevance(filename, on_status=None) -> bool:
     return False
 
 
-def parse_mirror_and_download(mirror_link, filename, needs_page_check=True, *, on_status=None, on_progress=None, _visited=None, network=None, worker_id=0, proxy=None):
+def parse_mirror_and_download(mirror_link, filename, needs_page_check=True, *, on_status=None, on_progress=None, _visited=None, _attempt_context=None, network=None, worker_id=0, proxy=None):
     """Port of the baseline mirror parser and alternative-gateway loop."""
     status_logger = globals().get("log_status")
     report = (
@@ -913,11 +946,29 @@ def parse_mirror_and_download(mirror_link, filename, needs_page_check=True, *, o
         if status_logger else (on_status or logging.getLogger(__name__).info)
     )
     try:
-        visited = _visited if _visited is not None else set()
+        # This context is deliberately created by one document worker and
+        # shared across all of that worker's top-level mirrors. It is never
+        # persisted, so a later recovery round receives a fresh opportunity.
+        attempt_context = _attempt_context if isinstance(_attempt_context, dict) else {}
+        visited = attempt_context.setdefault("visited_pages", _visited if _visited is not None else set())
+        attempted_routes = attempt_context.setdefault("attempted_download_routes", set())
+        failed_routes = attempt_context.setdefault("failed_routes", set())
+
+        def route_identity(link):
+            """Conservative attempt-local URL identity: no fragment, normalized host/query order."""
+            parsed = urlparse(urllib.parse.urldefrag(link)[0])
+            host = (parsed.hostname or "").lower().rstrip(".")
+            if not host:
+                return urllib.parse.urldefrag(link)[0]
+            port = f":{parsed.port}" if parsed.port else ""
+            query = urllib.parse.urlencode(sorted(urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)), doseq=True)
+            return urllib.parse.urlunparse((parsed.scheme.lower(), host + port, parsed.path, "", query, ""))
+
         mirror_link = urllib.parse.urldefrag(mirror_link)[0]
-        if mirror_link in visited or len(visited) >= 8:
+        mirror_identity = route_identity(mirror_link)
+        if mirror_identity in visited or len(visited) >= 8:
             return "retry_next"
-        visited.add(mirror_link)
+        visited.add(mirror_identity)
         mirror_parts = urlparse(mirror_link)
         mirror_host = (mirror_parts.hostname or "").lower()
 
@@ -964,6 +1015,22 @@ def parse_mirror_and_download(mirror_link, filename, needs_page_check=True, *, o
 
         if blocked(mirror_link):
             return "retry_next"
+
+        def attempt_download_route(direct_link, referer):
+            identity = route_identity(direct_link)
+            if identity in attempted_routes or identity in failed_routes:
+                report(f"TRACE route skipped: already attempted during this document attempt: {direct_link}")
+                return "retry_next"
+            attempted_routes.add(identity)
+            result = download_file(
+                direct_link, filename, referer,
+                on_status=on_status, on_progress=on_progress,
+                network=network, worker_id=worker_id, proxy=proxy,
+            )
+            if result is not True:
+                failed_routes.add(identity)
+            return result
+
         # A result row can already contain a direct Libgen GET/CDN route.  Do
         # not fetch it as HTML first: send it to the proven resumable transfer.
         if (
@@ -972,11 +1039,7 @@ def parse_mirror_and_download(mirror_link, filename, needs_page_check=True, *, o
             or is_ipfs_gateway(mirror_link)
         ):
             report(f"Final download candidates:\n1. {mirror_link}")
-            return download_file(
-                mirror_link, filename, mirror_link,
-                on_status=on_status, on_progress=on_progress,
-                network=network, worker_id=worker_id, proxy=proxy,
-            )
+            return attempt_download_route(mirror_link, mirror_link)
         with (nullcontext(network.session()) if network else c_requests.Session()) as s:
             report(f"🔍 curl_cffi (chrome120): Fetching mirror page HTML from {mirror_link} (timeout=15s)...")
             res = s.get(
@@ -1005,13 +1068,14 @@ def parse_mirror_and_download(mirror_link, filename, needs_page_check=True, *, o
             if blocked(link):
                 return
             path = parsed.path.lower()
+            identity = route_identity(link)
             if any(route in path for route in ("edition.php", "file.php", "ads.php")):
-                if (host.startswith("libgen.") or ".libgen." in host) and link not in visited and link not in discovery_links:
+                if (host.startswith("libgen.") or ".libgen." in host) and identity not in visited and link not in discovery_links:
                     discovery_links.append(link)
                 return
             if not ("get.php" in path or (host == "library.lol" and path.startswith("/main/")) or path.endswith(".pdf") or is_ipfs_gateway(link)):
                 return
-            if link not in download_links and link not in visited:
+            if link not in download_links and identity not in attempted_routes and identity not in failed_routes:
                 download_links.append(link)
 
         for anchor in soup.find_all("a", href=True):
@@ -1080,7 +1144,7 @@ def parse_mirror_and_download(mirror_link, filename, needs_page_check=True, *, o
         # falling through to an IPFS-only candidate set.
         if discovery_links and not any(candidate_priority(link) < 3 for link in download_links):
             for discovery_link in discovery_links:
-                if parse_mirror_and_download(discovery_link, filename, False, on_status=on_status, on_progress=on_progress, _visited=visited, network=network, worker_id=worker_id, proxy=proxy) is True:
+                if parse_mirror_and_download(discovery_link, filename, False, on_status=on_status, on_progress=on_progress, _visited=visited, _attempt_context=attempt_context, network=network, worker_id=worker_id, proxy=proxy) is True:
                     return True
 
         download_links = order_candidates(download_links)
@@ -1094,12 +1158,9 @@ def parse_mirror_and_download(mirror_link, filename, needs_page_check=True, *, o
             if blocked(direct_link):
                 continue
             if urlparse(direct_link).hostname == "library.lol" and urlparse(direct_link).path.startswith("/main/"):
-                result = parse_mirror_and_download(direct_link, filename, False, on_status=on_status, on_progress=on_progress, _visited=visited, network=network, worker_id=worker_id, proxy=proxy)
+                result = parse_mirror_and_download(direct_link, filename, False, on_status=on_status, on_progress=on_progress, _visited=visited, _attempt_context=attempt_context, network=network, worker_id=worker_id, proxy=proxy)
             else:
-                result = download_file(
-                    direct_link, filename, mirror_link, on_status=on_status, on_progress=on_progress,
-                    network=network, worker_id=worker_id, proxy=proxy,
-                )
+                result = attempt_download_route(direct_link, mirror_link)
             if result is True:
                 success = True
                 break
@@ -1111,7 +1172,7 @@ def parse_mirror_and_download(mirror_link, filename, needs_page_check=True, *, o
         if not success:
             for discovery_link in discovery_links:
                 report(f"🔍 Internal discovery page (not a download): {discovery_link}")
-                if parse_mirror_and_download(discovery_link, filename, False, on_status=on_status, on_progress=on_progress, _visited=visited, network=network, worker_id=worker_id, proxy=proxy) is True:
+                if parse_mirror_and_download(discovery_link, filename, False, on_status=on_status, on_progress=on_progress, _visited=visited, _attempt_context=attempt_context, network=network, worker_id=worker_id, proxy=proxy) is True:
                     success = True
                     break
         if success and filename.lower().endswith(".pdf") and needs_page_check:
@@ -1166,11 +1227,14 @@ def download_pdf(url: str | list[str], filename: str, *, defer_validation: bool 
                     # Validation is deliberately queued in bulk collection so PDF
                     # extraction never prevents the next document from starting.
                     if defer_validation:
+                        scheduled = _schedule_validation(filename)
+                        validation_status = str((_download_state_entry(filename) or {}).get("validation_status") or "").upper()
                         report(
-                            f"📄 PyPDF: Queuing first-page ASHRAE/HVAC keyword verification in the background; "
+                            f"⚠️ PDF integrity gate marked {filename} technically invalid; Stage 2 was not queued."
+                            if validation_status == "PDF_INVALID" else
+                            f"📄 PyPDF: {'Queued' if scheduled else 'Deferred'} first-page ASHRAE/HVAC keyword verification in the background; "
                             f"validation taking over {VALIDATION_TIMEOUT_SECONDS}s is marked pending while downloads continue."
                         )
-                        _schedule_validation(filename)
                         relevant = True
                     else:
                         relevant = _check_download_relevance(filename, report)
@@ -1220,7 +1284,10 @@ def _bulk_candidates_from_page(
             continue
         mirrors = _document_mirror_links(document, rows, search_url)
         if mirrors:
-            candidates.append({"filename": filename, "mirrors": mirrors, "source_url": str(document.get("link") or "")})
+            candidates.append({
+                "filename": filename, "mirrors": mirrors, "source_url": str(document.get("link") or ""),
+                "source_page": page_number, "source_item": item_number,
+            })
     return candidates, skipped_completed
 
 
@@ -1233,57 +1300,75 @@ def _validate_pdf_stage2(
     if existing_report and not force:
         return existing_report
 
-    report(f"📄 PyPDF: Sampling representative pages and metadata for Stage 2 validation: {file_path.name}")
-    preview = extract_pdf_preview(file_path)
-    if preview["error"]:
+    integrity = check_pdf_integrity(file_path)
+    if not integrity["valid"]:
+        report(
+            f"⚠️ PDF integrity gate blocked Stage 2 for {file_path.name}: "
+            f"{integrity['error_type']}"
+        )
+        preview = {
+            "text": "", "metadata": {}, "page_count": int(integrity.get("page_count") or 0),
+            "pages_sampled": [], "pages_with_text": 0, "characters": 0,
+            "toc_pages": [], "extraction_quality": "empty", "error": integrity["error_message"],
+        }
         validation = {
-            "status": "PENDING", "approved": False, "score": 0, "confidence": "low",
-            "needs_more_text": False, "categories": [], "reason": preview["error"],
+            "status": "PDF_INVALID", "approved": False, "score": 0, "confidence": "technical",
+            "needs_more_text": False, "categories": [],
+            "reason": f"{integrity['error_type']}: {integrity['error_message']}",
+            "technical_error_type": integrity["error_type"], "technical_error_message": integrity["error_message"],
         }
     else:
-        report(
-            f"📄 Preview quality: {preview['extraction_quality']} · pages {preview['pages_sampled']} · "
-            f"{preview['characters']} characters · {preview['pages_with_text']} page(s) with usable text."
-        )
-
-        def evaluate(current_preview: dict[str, Any]) -> dict[str, Any]:
-            report(f"🧠 Stage 2: Sending PDF evidence for {file_path.name} to CrewAI/OpenRouter...")
-            return asyncio.run(invoke_pdf_validation_graph({
-                "filename": file_path.name,
-                "pdf_text": current_preview["text"],
-                "pdf_metadata": current_preview["metadata"],
-                "extraction_error": current_preview["error"],
-                "extraction_quality": current_preview["extraction_quality"],
-                "pages_sampled": current_preview["pages_sampled"],
-                "page_count": current_preview["page_count"],
-                "source_metadata": {"source": source, "stage1_score": stage1_score},
-                "validation": {},
-            }, report))["validation"]
-
-        validation = evaluate(preview)
-        if validation.get("needs_more_text") and len(preview["pages_sampled"]) < min(preview["page_count"], 10):
-            report("📄 Stage 2 requested more evidence; sampling the next representative PDF pages once.")
-            extra = extract_pdf_preview(
-                file_path,
-                start_page=len(preview["pages_sampled"]),
-                max_pages=10 - len(preview["pages_sampled"]),
-                max_characters=max(0, 12000 - preview["characters"]),
+        report(f"📄 PyPDF: Sampling representative pages and metadata for Stage 2 validation: {file_path.name}")
+        preview = extract_pdf_preview(file_path)
+        if preview["error"]:
+            validation = {
+                "status": "PENDING", "approved": False, "score": 0, "confidence": "low",
+                "needs_more_text": False, "categories": [], "reason": preview["error"],
+            }
+        else:
+            report(
+                f"📄 Preview quality: {preview['extraction_quality']} · pages {preview['pages_sampled']} · "
+                f"{preview['characters']} characters · {preview['pages_with_text']} page(s) with usable text."
             )
-            if not extra["error"]:
-                preview = {
-                    **preview,
-                    "text": (preview["text"] + "\n\n" + extra["text"]).strip()[:12000],
-                    "pages_sampled": preview["pages_sampled"] + extra["pages_sampled"],
-                    "pages_with_text": preview["pages_with_text"] + extra["pages_with_text"],
-                    "characters": min(12000, preview["characters"] + extra["characters"]),
-                    "toc_pages": preview["toc_pages"] + extra["toc_pages"],
-                    "extraction_quality": "good" if preview["characters"] + extra["characters"] >= 2500 and preview["pages_with_text"] + extra["pages_with_text"] >= 2 else preview["extraction_quality"],
-                }
-                validation = evaluate(preview)
+
+            def evaluate(current_preview: dict[str, Any]) -> dict[str, Any]:
+                report(f"🧠 Stage 2: Sending PDF evidence for {file_path.name} to CrewAI/OpenRouter...")
+                return asyncio.run(invoke_pdf_validation_graph({
+                    "filename": file_path.name,
+                    "pdf_text": current_preview["text"],
+                    "pdf_metadata": current_preview["metadata"],
+                    "extraction_error": current_preview["error"],
+                    "extraction_quality": current_preview["extraction_quality"],
+                    "pages_sampled": current_preview["pages_sampled"],
+                    "page_count": current_preview["page_count"],
+                    "source_metadata": {"source": source, "stage1_score": stage1_score},
+                    "validation": {},
+                }, report))["validation"]
+
+            validation = evaluate(preview)
+            if validation.get("needs_more_text") and len(preview["pages_sampled"]) < min(preview["page_count"], 10):
+                report("📄 Stage 2 requested more evidence; sampling the next representative PDF pages once.")
+                extra = extract_pdf_preview(
+                    file_path,
+                    start_page=len(preview["pages_sampled"]),
+                    max_pages=10 - len(preview["pages_sampled"]),
+                    max_characters=max(0, 12000 - preview["characters"]),
+                )
+                if not extra["error"]:
+                    preview = {
+                        **preview,
+                        "text": (preview["text"] + "\n\n" + extra["text"]).strip()[:12000],
+                        "pages_sampled": preview["pages_sampled"] + extra["pages_sampled"],
+                        "pages_with_text": preview["pages_with_text"] + extra["pages_with_text"],
+                        "characters": min(12000, preview["characters"] + extra["characters"]),
+                        "toc_pages": preview["toc_pages"] + extra["toc_pages"],
+                        "extraction_quality": "good" if preview["characters"] + extra["characters"] >= 2500 and preview["pages_with_text"] + extra["pages_with_text"] >= 2 else preview["extraction_quality"],
+                    }
+                    validation = evaluate(preview)
 
     original_size = file_path.stat().st_size if file_path.exists() else 0
     status = str(validation.get("status") or "PENDING").upper()
-    if status not in {"APPROVED", "REJECTED", "PENDING"}:
+    if status not in {"APPROVED", "REJECTED", "PENDING", "PDF_INVALID"}:
         status = "PENDING"
     if status == "APPROVED" and (not validation.get("approved") or int(validation.get("score", 0)) < 70):
         status = "PENDING"
@@ -1306,6 +1391,8 @@ def _validate_pdf_stage2(
         "needs_more_text": bool(validation.get("needs_more_text")),
         "categories": validation.get("categories", []),
         "reason": validation.get("reason", "Stage 2 returned no reason"),
+        "technical_error_type": validation.get("technical_error_type"),
+        "technical_error_message": validation.get("technical_error_message"),
         "stage2_raw_response": str(validation.get("raw_response") or "")[:4000],
         "stage2_normalized_result": {
             key: validation.get(key) for key in (
@@ -1319,7 +1406,7 @@ def _validate_pdf_stage2(
         "page_count": preview["page_count"],
         "toc_pages": preview["toc_pages"],
         "pdf_metadata": preview["metadata"],
-        "stage2_completed": status in {"APPROVED", "REJECTED"},
+        "stage2_completed": status in {"APPROVED", "REJECTED", "PDF_INVALID"},
     }
     write_validation_report(file_path, DATA_DIRECTORY, validation_report)
     report(
@@ -1329,6 +1416,8 @@ def _validate_pdf_stage2(
         _update_download_state(
             file_path.name, "", "COMPLETED", size=original_size,
             reason=validation_report["reason"], completed=True, validation_status=status,
+            technical_error_type=validation.get("technical_error_type"),
+            technical_error_message=validation.get("technical_error_message"),
         )
     return validation_report
 
@@ -1397,8 +1486,13 @@ def _run_validation_job(job: dict[str, Any], worker_id: int) -> None:
             propagator(filename, str(validation.get("status") or "PENDING"))
         if callable(event_emitter):
             validation_status = str(validation.get("status") or "PENDING").upper()
+            event_kind = (
+                "STAGE2_INVALID" if validation_status == "PDF_INVALID" else
+                f"STAGE2_{validation_status}" if validation_status in {"APPROVED", "REJECTED"} else
+                "STAGE2_PENDING"
+            )
             event_emitter(
-                f"STAGE2_{validation_status}" if validation_status in {"APPROVED", "REJECTED"} else "STAGE2_PENDING",
+                event_kind,
                 candidate=event_candidate, filename=filename,
             )
     except Exception as exc:
@@ -1434,8 +1528,24 @@ def _schedule_validation(filename: str, *, stage1_score: int | None = 100) -> bo
         return False
     existing = _download_state_entry(filename) or {}
     validation_status = str(existing.get("validation_status") or "").upper()
-    if validation_status in {"APPROVED", "REJECTED"}:
+    if validation_status in {"APPROVED", "REJECTED", "PDF_INVALID"}:
         return True
+    integrity = check_pdf_integrity(destination)
+    if not integrity["valid"]:
+        reason = f"{integrity['error_type']}: {integrity['error_message']}"
+        _update_download_state(
+            filename, "", "COMPLETED", size=int(integrity.get("size") or 0), completed=True,
+            validation_status="PDF_INVALID", reason=reason,
+            technical_error_type=integrity["error_type"], technical_error_message=integrity["error_message"],
+        )
+        event_emitter = globals().get("_emit_pipeline_event")
+        if callable(event_emitter):
+            event_emitter(
+                "STAGE2_INVALID", candidate={"run_id": str((existing.get("candidate") or {}).get("run_id") or "")},
+                filename=filename, message=reason,
+            )
+        logging.getLogger(__name__).warning("PDF integrity gate rejected %s: %s", filename, integrity["error_type"])
+        return False
     queue = _validation_queue()
     if queue.contains(filename):
         return True
@@ -1473,7 +1583,7 @@ def _restore_pending_validation_jobs() -> int:
         if str(entry.get("status", "")).upper() != "COMPLETED":
             continue
         if str(entry.get("validation_status") or "PENDING").upper() in {
-            "APPROVED", "REJECTED", "RUNNING", "DUPLICATE_PENDING",
+            "APPROVED", "REJECTED", "RUNNING", "DUPLICATE_PENDING", "PDF_INVALID",
         }:
             continue
         filename = str(entry.get("filename") or "")
@@ -1602,8 +1712,20 @@ def _download_worker(candidate: dict[str, Any], network: NetworkManager, worker_
     filename = candidate["filename"]
     document_attempt = int(candidate.get("_document_attempt", 1) or 1)
     max_attempts = network.settings.max_document_attempts
+    work_kind = str(candidate.get("work_kind") or ("recovery" if candidate.get("_recovery_round") else "primary"))
     state_candidate = {key: value for key, value in candidate.items() if not key.startswith("_")}
     event_emitter = globals().get("_emit_pipeline_event")
+
+    def emit_network(kind: str, message: str = "", *, level: str = "STATUS", state: str | None = None,
+                     gateway_host: str | None = None, **extra: Any) -> None:
+        network.emit(
+            kind, worker_id, filename, message,
+            level=level, category="download", document_id=str(candidate.get("document_id") or filename),
+            source_page=candidate.get("source_page"), source_item=candidate.get("source_item"),
+            work_kind=work_kind, document_attempt=document_attempt, max_attempts=max_attempts,
+            state=state, gateway_host=gateway_host, short_message=extra.pop("short_message", message),
+            **extra,
+        )
     if not 1 <= document_attempt <= max_attempts:
         _update_download_state(
             filename, candidate.get("source_url", ""), "PERMANENTLY_FAILED", size=_download_size(filename),
@@ -1623,37 +1745,82 @@ def _download_worker(candidate: dict[str, Any], network: NetworkManager, worker_
         event_emitter(
             "DOWNLOAD_STARTED", candidate=state_candidate, filename=filename,
             message=f"Download worker {worker_id} started {filename}", attempt=document_attempt,
+            recovery=bool(candidate.get("_recovery_round")),
         )
     proxy = network.begin_download(worker_id, filename)
 
     def status(message: str) -> None:
-        network.emit("status", worker_id, filename, message)
+        lowered = message.lower()
+        url_match = re.search(r"https?://[^\s]+", message)
+        gateway_host = urlparse(url_match.group(0)).hostname if url_match else None
+        state = (
+            "RETRYING" if "download recovery" in lowered or "resuming" in lowered else
+            "STALLED" if "gateway unhealthy" in lowered or "stalled" in lowered else
+            "SWITCHING_ROUTE" if "alternative gateway" in lowered or "switch gateway" in lowered else
+            "DOWNLOADING"
+        )
+        # Raw transfer diagnostics remain available in the bounded debug view;
+        # only meaningful state changes become normal activity events.
+        emit_network(
+            "debug", message, level="TRACE" if message.startswith("TRACE") else "DEBUG",
+            state=state, gateway_host=gateway_host,
+        )
+        if state != "DOWNLOADING":
+            emit_network(
+                "worker_state", state=state, gateway_host=gateway_host,
+                short_message=message.split("\n", 1)[0],
+            )
 
     def progress(downloaded: int, total: int | None) -> None:
         _update_download_state(
             filename, candidate.get("source_url", ""), "DOWNLOADING", size=downloaded,
             candidate=state_candidate, document_attempt=document_attempt,
         )
-        network.emit("progress", worker_id, filename, downloaded=downloaded, total=total or 0)
+        emit_network(
+            "progress", level="DEBUG", state="MAKING_PROGRESS", downloaded=downloaded, total=total or 0,
+            bytes_downloaded=downloaded, total_bytes=total or 0,
+            short_message=f"Worker {worker_id} resumed/progressed to {downloaded / (1024 * 1024):.2f} MB",
+        )
 
+    emit_network(
+        "worker_state", state="DOWNLOADING",
+        short_message=(
+            f"↓ Worker {worker_id} started {work_kind.title()} attempt {document_attempt}/{max_attempts}"
+        ),
+        bytes_downloaded=_download_size(filename),
+    )
     status(
-        f"⬇️ {'Recovery' if document_attempt > 1 else 'Primary'} download attempt "
-        f"{document_attempt}/{max_attempts}; existing partial: {_download_size(filename) / (1024 * 1024):.2f} MB."
+        f"⬇️ {work_kind.title()} download attempt {document_attempt}/{max_attempts}; "
+        f"existing partial: {_download_size(filename) / (1024 * 1024):.2f} MB."
     )
     last_reason = "all valid gateways failed"
+    attempt_context = {"visited_pages": set(), "attempted_download_routes": set(), "failed_routes": set()}
     try:
         for mirror_attempt, mirror in enumerate(candidate["mirrors"], start=1):
+            emit_network(
+                "worker_state", state="SWITCHING_ROUTE", gateway_host=urlparse(mirror).hostname,
+                short_message=f"↻ Worker {worker_id} resolving route {mirror_attempt}/{len(candidate['mirrors'])}",
+            )
             result = parse_mirror_and_download(
                 mirror, filename, needs_page_check=False, on_status=status,
-                on_progress=progress, network=network, worker_id=worker_id, proxy=proxy,
+                on_progress=progress, _attempt_context=attempt_context,
+                network=network, worker_id=worker_id, proxy=proxy,
             )
             if result is True:
                 _update_download_state(
                     filename, candidate.get("source_url", ""), "COMPLETED", size=_download_size(filename),
                     candidate=state_candidate, document_attempt=document_attempt, completed=True,
                 )
-                _schedule_validation(filename, stage1_score=candidate.get("stage1_score", 100))
-                network.emit("success", worker_id, filename, "Downloaded successfully; Stage 2 PDF validation queued.")
+                scheduled = _schedule_validation(filename, stage1_score=candidate.get("stage1_score", 100))
+                validation_status = str((_download_state_entry(filename) or {}).get("validation_status") or "").upper()
+                validation_message = (
+                    "Downloaded successfully; PDF integrity gate marked the file technically invalid; Stage 2 was not queued."
+                    if validation_status == "PDF_INVALID" else
+                    "Downloaded successfully; Stage 2 PDF validation queued."
+                    if scheduled else "Downloaded successfully; Stage 2 validation is pending queue capacity."
+                )
+                emit_network("success", validation_message, level="LIFECYCLE", state="COMPLETED",
+                             short_message=f"✓ Worker {worker_id} completed PDF; Stage 2 {'queued' if scheduled else 'pending'}")
                 if callable(event_emitter):
                     event_emitter("DOWNLOAD_COMPLETED", candidate=state_candidate, filename=filename)
                 return {"success": True, "candidate": candidate, "attempt": document_attempt}
@@ -1675,10 +1842,18 @@ def _download_worker(candidate: dict[str, Any], network: NetworkManager, worker_
         reason=last_reason, candidate=state_candidate, document_attempt=document_attempt, completed=False,
     )
     action = "permanent failure limit reached" if final_status == "PERMANENTLY_FAILED" else "scheduled for next recovery round"
-    network.emit(
-        "failure", worker_id, filename,
+    terminal_state = "PERMANENTLY_FAILED" if final_status == "PERMANENTLY_FAILED" else "RECOVERY_WAIT"
+    emit_network(
+        "failure",
         f"⚠️ Download attempt ended\nDocument: {filename}\nAttempt: {document_attempt}/{max_attempts}\n"
         f"Downloaded: {_download_size(filename) / (1024 * 1024):.2f} MB\nReason: {last_reason}\nAction: {action}",
+        level="LIFECYCLE", state=terminal_state,
+        short_message=(
+            f"✕ Worker {worker_id} final failure · attempt {document_attempt}/{max_attempts} exhausted"
+            if final_status == "PERMANENTLY_FAILED" else
+            f"⚠ Worker {worker_id} stalled; moved to recovery after attempt {document_attempt}/{max_attempts}"
+        ),
+        bytes_downloaded=_download_size(filename),
     )
     if callable(event_emitter):
         event_emitter(
@@ -1801,10 +1976,13 @@ class _StreamlitDownloadCoordinator:
     Streamlit rendering and turns worker outcomes into recovery candidates.
     """
 
-    def __init__(self, network: NetworkManager, debug) -> None:
+    def __init__(self, network: NetworkManager, debug, *, on_drain=None, panels: dict[str, Any] | None = None) -> None:
         self.network = network
         self.debug = debug
-        self.cards: dict[str, tuple[Any, Any]] = {}
+        self.on_drain = on_drain
+        self.panels = panels or {}
+        self.presentation = DownloadPresentation(max_workers=network.settings.max_workers)
+        self.recovery_jobs: dict[str, dict[str, Any]] = {}
         self.completed = 0
         self.queue = GlobalDownloadQueue(
             lambda candidate, worker_id: _download_worker(candidate, network, worker_id),
@@ -1813,20 +1991,60 @@ class _StreamlitDownloadCoordinator:
         )
 
     def _card(self, candidate: dict[str, Any], *, recovery: bool) -> None:
-        filename = candidate["filename"]
-        existing = self.cards.get(filename)
-        if existing:
-            existing[0].write("♻️ Re-queued for the next global recovery round.")
-            return
-        with st.status(f"⬇️ Processing: {filename[:40]}...", expanded=False) as card:
-            card.write(
-                "♻️ Queued for global recovery." if recovery
-                else "⏳ Queued for a controlled global curl_cffi worker..."
-            )
-            self.cards[filename] = (card, st.empty())
+        provenance = _candidate_provenance_label(candidate)
+        if recovery:
+            self.recovery_jobs[candidate["filename"]] = dict(candidate)
+            self.presentation.activity.append(f"♻ {provenance} queued for recovery")
+        else:
+            self.presentation.activity.append(f"↓ {provenance} queued for a download worker")
+        self._render_panels()
+
+    @staticmethod
+    def _worker_row(row: dict[str, Any]) -> str:
+        worker = int(row.get("worker", 0))
+        state = str(row.get("state") or "IDLE")
+        if state == "IDLE":
+            return f"W{worker} | Idle"
+        source_page, source_item = row.get("source_page"), row.get("source_item")
+        source = f"page {source_page} · item {source_item}" if source_page and source_item else "source unavailable"
+        downloaded = float(row.get("bytes_downloaded", 0) or 0) / (1024 * 1024)
+        total = float(row.get("total_bytes", 0) or 0) / (1024 * 1024)
+        progress = f"{downloaded:.2f} MB" + (f" / {total:.2f} MB" if total else "")
+        attempt = f"{row.get('document_attempt', '?')}/{row.get('max_attempts', '?')}"
+        route = str(row.get("gateway_host") or "resolving")
+        title = str(row.get("filename") or "").replace("\n", " ")[:72]
+        return f"W{worker} | {row.get('work_kind', 'primary')} | {state} | {progress} | {source} | attempt {attempt} | {route} | {title}"
+
+    def _render_panels(self) -> None:
+        """Render only from the Streamlit coordinator/main thread."""
+        worker_panel = self.panels.get("workers")
+        if worker_panel is not None:
+            worker_panel.code("\n".join(self._worker_row(row) for row in self.presentation.worker_rows()), language=None)
+        activity_panel = self.panels.get("activity")
+        if activity_panel is not None:
+            entries = list(self.presentation.activity)[-80:]
+            activity_panel.markdown("\n".join(f"- {entry}" for entry in entries) or "No lifecycle activity yet.")
+        recovery_panel = self.panels.get("recovery")
+        if recovery_panel is not None:
+            distribution: dict[int, int] = {}
+            for job in self.recovery_jobs.values():
+                attempt = int(job.get("_document_attempt", 1) or 1)
+                distribution[attempt] = distribution.get(attempt, 0) + 1
+            attempts = " · ".join(f"{attempt}/{self.network.settings.max_document_attempts}: {count}" for attempt, count in sorted(distribution.items())) or "none"
+            recovery_panel.caption(f"Recovery backlog: {len(self.recovery_jobs)} · Attempt distribution: {attempts}")
+        debug_panel = self.panels.get("debug")
+        if debug_panel is not None:
+            debug_panel.code("\n\n".join(self.presentation.debug), language=None)
+
+    def set_recovery_backlog(self, candidates: list[dict[str, Any]]) -> None:
+        self.recovery_jobs = {str(job.get("filename")): dict(job) for job in candidates if job.get("filename")}
+        self._render_panels()
 
     async def enqueue(self, candidate: dict[str, Any], *, recovery: bool = False) -> None:
         """Apply backpressure without blocking the search producer's event loop."""
+        candidate["work_kind"] = "recovery" if recovery else str(candidate.get("work_kind") or "primary")
+        if recovery:
+            candidate["_recovery_round"] = True
         # Persist and render before admission: a fast worker must never have its
         # DOWNLOADING transition overwritten by a late QUEUED transition.
         self._card(candidate, recovery=recovery)
@@ -1848,39 +2066,34 @@ class _StreamlitDownloadCoordinator:
                 event = self.network.events.get_nowait()
             except Empty:
                 break
-            card_pair = self.cards.get(event["filename"])
-            if not card_pair:
-                continue
-            card, progress = card_pair
-            if event["kind"] == "progress":
-                total, transferred = event["total"], event["downloaded"]
-                fraction = min(transferred / total, 1.0) if total else 0.0
-                progress.progress(
-                    fraction,
-                    text=(f"Worker {event['worker']}/{self.network.settings.max_workers}: "
-                          f"{transferred / (1024 * 1024):.2f} MB" +
-                          (f" / {total / (1024 * 1024):.2f} MB" if total else "")),
-                )
-            else:
-                card.write(event["message"])
+            self.presentation.consume(event)
 
         failed: list[dict[str, Any]] = []
         for outcome in self.queue.drain_outcomes():
             candidate, result = outcome.candidate, outcome.result
             filename = candidate["filename"]
-            card, progress = self.cards[filename]
-            progress.empty()
             if result.get("success"):
                 self.completed += 1
-                card.update(label=f"✅ Secured: {filename[:40]}", state="complete", expanded=False)
+                self.recovery_jobs.pop(filename, None)
+                self.presentation.activity.append(f"✓ Download completed · {_candidate_provenance_label(candidate)} · {filename[:60]}")
                 self.debug(f"Filename: {filename}\nDownloaded successfully")
             elif result.get("permanent"):
-                card.update(label=f"❌ Failed: {filename[:40]}", state="error", expanded=False)
+                self.recovery_jobs.pop(filename, None)
+                self.presentation.activity.append(
+                    f"✕ Final failure · {_candidate_provenance_label(candidate)} · attempt "
+                    f"{result.get('attempt', '?')}/{self.network.settings.max_document_attempts} exhausted"
+                )
             else:
                 if result.get("exception"):
                     self.debug(f"Filename: {filename}\nFailure reason:\n{result['exception']!r}")
-                card.update(label=f"⚠️ Pending recovery: {filename[:40]}", state="running", expanded=False)
+                self.presentation.activity.append(f"⚠ Download stalled; moved to recovery · {_candidate_provenance_label(candidate)}")
                 failed.append(result)
+        self._render_panels()
+        # This is called from the Streamlit coroutine, never from a worker.
+        # Rendering aggregated worker lifecycle events here keeps active queue
+        # drains observable without permitting worker threads to call st.*.
+        if callable(self.on_drain):
+            self.on_drain()
         return failed
 
     async def drain_until_idle(self) -> list[dict[str, Any]]:
@@ -2007,10 +2220,16 @@ async def run_scraping_pipeline(
     pages_processed = 0
     documents_approved = 0
     documents_downloaded = _completed_download_count()
+    # A run identifier lets worker threads publish only data while this main
+    # Streamlit invocation decides what to render.  It also prevents a later
+    # rerun from consuming another run's still-pending events.
+    run_id = f"run-{time.time_ns():x}"
+    live_metrics = RunMetrics(existing_downloads=documents_downloaded)
+    metrics_placeholder = None
     if hasattr(st, "session_state"):
         st.session_state["_download_debug"] = []
     failed_urls: list[str] = []
-    debug_events: list[str] = []
+    debug_events: deque[str] = deque(maxlen=500)
     network = NetworkManager(PROJECT_ROOT)
     restored_stage2_jobs = _restore_pending_validation_jobs()
     scheduled_filenames: set[str] = set()
@@ -2023,6 +2242,7 @@ async def run_scraping_pipeline(
         query, max_document_attempts=network.settings.max_document_attempts,
     )
     for job in restored_recovery_jobs:
+        job.setdefault("run_id", run_id)
         recovery_backlog.add_restored(job)
     scheduled_filenames.update(job["filename"] for job in restored_recovery_jobs)
     scheduled_document_ids.update(
@@ -2033,7 +2253,49 @@ async def run_scraping_pipeline(
     def debug(message: str) -> None:
         debug_events.append(message)
 
-    coordinator = _StreamlitDownloadCoordinator(network, debug)
+    # Agent Activity is a view over structured events; it never dictates work
+    # scheduling. The five worker rows and the two validation counters update
+    # in place while discovery continues independently.
+    pipeline_area = st.container()
+    downloads_area = st.container()
+    with downloads_area:
+        st.markdown("### Agent activity")
+        overview_placeholder = st.empty()
+        st.markdown("#### Active downloads")
+        worker_placeholder = st.empty()
+        with st.expander("Recent pipeline activity", expanded=True):
+            activity_placeholder = st.empty()
+        with st.expander("Recovery summary", expanded=False):
+            recovery_placeholder = st.empty()
+        with st.expander("Show detailed network/debug log", expanded=False):
+            network_debug_placeholder = st.empty()
+    metrics_placeholder = overview_placeholder
+
+    def refresh_live_metrics() -> None:
+        """Consume worker events from the Streamlit thread only."""
+        for event in _PIPELINE_EVENTS.drain(run_id):
+            live_metrics.consume(event)
+        if metrics_placeholder is not None:
+            metrics_placeholder.markdown(
+                "**Pipeline overview**  \n"
+                f"Discovery: page {min(pages_processed + 1, max_pages)} / {max_pages} · "
+                f"Discovered: {live_metrics.discovered} · Stage 1 approved: {live_metrics.stage1_approved}  \n"
+                f"Downloads: {live_metrics.total_downloaded} / {target_documents} · "
+                f"Active downloads: {live_metrics.downloading} / {network.settings.max_workers} · "
+                f"Recovery backlog: {live_metrics.recovery_queued}  \n"
+                f"Stage 2: active {live_metrics.stage2_running} / {network.settings.validation_workers} · "
+                f"approved {live_metrics.stage2_approved} · rejected {live_metrics.stage2_rejected} · "
+                f"pending {live_metrics.stage2_pending} · LangSmith: {langsmith_status()}"
+            )
+
+    coordinator = _StreamlitDownloadCoordinator(
+        network, debug, on_drain=refresh_live_metrics,
+        panels={
+            "workers": worker_placeholder, "activity": activity_placeholder,
+            "recovery": recovery_placeholder, "debug": network_debug_placeholder,
+        },
+    )
+    coordinator.set_recovery_backlog(restored_recovery_jobs)
 
     def collect_primary_outcomes() -> None:
         """Keep discovery productive while workers finish in the background."""
@@ -2043,13 +2305,11 @@ async def run_scraping_pipeline(
         if new_completions:
             documents_downloaded += new_completions
             queue_completions_seen = coordinator.completed
-    # Sibling containers keep the document cards visible when the pipeline closes.
-    pipeline_area = st.container()
-    downloads_area = st.container()
-
+        refresh_live_metrics()
     with pipeline_area:
         with st.status("🤖 Agentic Pipeline Initialized...", expanded=True) as main_status:
             log = main_status.write
+            refresh_live_metrics()
             if recovery_backlog:
                 log(
                     f"♻️ Restored {len(recovery_backlog)} interrupted download(s); "
@@ -2065,7 +2325,7 @@ async def run_scraping_pipeline(
                     )
                     break
                 main_status.update(
-                    label=f"🤖 Researching page {page_number} of {max_pages}...",
+                    label=f"🔎 Discovery: Search page {page_number} / {max_pages}",
                     state="running", expanded=True,
                 )
                 log(f"——— Page {page_number} of {max_pages} ———")
@@ -2129,6 +2389,10 @@ async def run_scraping_pipeline(
                     debug(f"Page {page_number}: mirror-row parsing failed:\n{traceback.format_exc()}")
                 try:
                     search_documents = _extract_search_documents(raw_html, search_url)
+                    _emit_pipeline_event(
+                        "DOCUMENT_DISCOVERED", run_id=run_id, count=len(search_documents),
+                        message=f"Page {page_number}: parsed {len(search_documents)} document records",
+                    )
                     parsed_document_count = len(search_documents)
                     log(f"📋 Extraction complete: {len(search_documents)} document record(s), {len(search_rows)} row-level mirror group(s).")
                     debug(f"Page {page_number}: extracted {len(search_documents)} search-result document(s).")
@@ -2208,6 +2472,8 @@ async def run_scraping_pipeline(
                 )
 
                 log(f"🧠 Stage 1: Sending {len(search_documents)} document record(s) to CrewAI/OpenRouter...")
+                _emit_pipeline_event("STAGE1_STARTED", run_id=run_id, count=len(document_batch))
+                refresh_live_metrics()
                 try:
                     graph_state = await invoke_scraper_graph(
                         {
@@ -2250,12 +2516,20 @@ async def run_scraping_pipeline(
                             }),
                             "title": rejected_title,
                             "query": query.strip(),
+                            "run_id": run_id,
+                            "source_page": page_number,
+                            "source_item": int(document["id"]),
                             "stage1_status": "REJECTED",
                         }
                         _update_download_state(
                             rejected_filename, rejected_candidate["source_url"], "STAGE1_REJECTED",
                             candidate=rejected_candidate, completed=False,
                         )
+                    _emit_pipeline_event("STAGE1_APPROVED", run_id=run_id, count=len(approved_docs))
+                    _emit_pipeline_event(
+                        "STAGE1_REJECTED", run_id=run_id,
+                        count=max(0, len(document_batch) - len(approved_docs)),
+                    )
                     debug(
                         f"Page {page_number}: evaluator returned {len(extracted_documents)} document(s); "
                         f"{len(approved_docs)} approved for download."
@@ -2269,6 +2543,8 @@ async def run_scraping_pipeline(
                         )
                     )
                 except Exception:
+                    _emit_pipeline_event("STAGE1_FAILED", run_id=run_id, count=len(document_batch))
+                    refresh_live_metrics()
                     debug(f"Page {page_number}: document evaluation failed:\n{traceback.format_exc()}")
                     log("Document evaluation could not finish for this page. Continuing...")
                     continue
@@ -2326,6 +2602,9 @@ async def run_scraping_pipeline(
                             "document_id": candidate_identity,
                             "title": title,
                             "query": query.strip(),
+                            "run_id": run_id,
+                            "source_page": page_number,
+                            "source_item": int(document["id"]),
                         }
                         scheduled_filenames.add(filename)
                         scheduled_document_ids.add(candidate_identity)
@@ -2333,7 +2612,9 @@ async def run_scraping_pipeline(
                         primary_jobs_queued += 1
                         with downloads_area:
                             await coordinator.enqueue(candidate)
+                        _emit_pipeline_event("DOWNLOAD_QUEUED", candidate=candidate, filename=filename)
                         log(f"  ⬇️ Queued for download: {filename}")
+                refresh_live_metrics()
                 log(
                     f"📊 Page {page_number} summary: queued {queued_now} · already stored {already_stored} · "
                     f"recovery retained {recovery_retained} · missing links {missing_links}"
@@ -2359,12 +2640,14 @@ async def run_scraping_pipeline(
                 )
                 if terminal:
                     failed_urls.extend(dict(result.get("candidate") or {}).get("mirrors", []))
+            coordinator.set_recovery_backlog(recovery_backlog.snapshot())
 
             recovery_round = 1
             while recovery_backlog:
                 valid_recovery_jobs = recovery_backlog.take_round(
                     max_attempts=network.settings.max_document_attempts,
                 )
+                coordinator.set_recovery_backlog(recovery_backlog.snapshot())
                 if not valid_recovery_jobs:
                     break
                 delay = max(
@@ -2382,7 +2665,10 @@ async def run_scraping_pipeline(
                     )
                 with downloads_area:
                     for candidate in valid_recovery_jobs:
+                        candidate.setdefault("run_id", run_id)
                         await coordinator.enqueue(candidate, recovery=True)
+                        _emit_pipeline_event("RECOVERY_QUEUED", candidate=candidate, filename=candidate["filename"])
+                refresh_live_metrics()
                 failed_recovery = await coordinator.drain_until_idle()
                 new_completions = coordinator.completed - queue_completions_seen
                 documents_downloaded += new_completions
@@ -2393,8 +2679,10 @@ async def run_scraping_pipeline(
                     )
                     if terminal:
                         failed_urls.extend(dict(result.get("candidate") or {}).get("mirrors", []))
+                coordinator.set_recovery_backlog(recovery_backlog.snapshot())
                 recovery_round += 1
 
+            refresh_live_metrics()
             if pages_processed or documents_downloaded >= target_documents:
                 final_label = (
                     f"✅ Collection finished — {documents_downloaded} / {target_documents} stored; {documents_approved} AI approved."
@@ -2414,7 +2702,7 @@ async def run_scraping_pipeline(
     with st.expander("Retrieval debug", expanded=False):
         st.caption(
             f"Pages evaluated: {pages_processed} · Documents approved: {documents_approved} · "
-            f"Documents downloaded: {documents_downloaded}"
+            f"Documents downloaded: {documents_downloaded} · Worker events consumed: {live_metrics.event_count}"
         )
         if failed_urls:
             st.write("Failed URLs (up to 20):")
