@@ -202,21 +202,26 @@ def evaluate_documents(state: ScraperState) -> dict[str, list[dict[str, Any]]]:
 
     try:
         storage_path = prepare_storage()
-        _report_status(f"🗃️ CrewAI: Writable runtime storage verified at {storage_path}; memory and historical task-output SQLite disabled.")
+        batch_size = len(documents) if documents is not None else "markdown"
+        _report_status(
+            f"🤖 CrewAI Stage 1: Evaluating {batch_size} document(s) via OpenRouter "
+            f"(runtime storage ready at {storage_path})."
+        )
         crew = StatelessCrew(
             agents=[evaluator],
             tasks=[evaluation_task],
             memory=False,
             verbose=False,
         )
-        _report_status(
-            f"🤖 CrewAI: Evaluating one JSON batch of {len(documents)} documents with OpenRouter's free router..."
-            if documents is not None else "🧠 Evaluating documents with OpenRouter's free router..."
-        )
         crew_output = crew.kickoff()
         extracted_documents = (
             _approved_batch_documents(crew_output, documents)
             if documents is not None else _parse_document_list(crew_output)
+        )
+        _report_status(
+            f"✅ CrewAI Stage 1: Approved {len(extracted_documents)}"
+            + (f" of {len(documents)}" if documents is not None else "")
+            + " document(s)."
         )
     except (ValueError, RuntimeError):
         raise
@@ -345,15 +350,17 @@ def evaluate_pdf_content(state: PdfValidationState) -> dict[str, dict[str, Any]]
     )
     try:
         storage_path = prepare_storage()
-        _report_status(f"🗃️ CrewAI: Stage 2 storage verified at {storage_path}; validating PDF content.")
+        _report_status(
+            f"🤖 CrewAI Stage 2: Reviewing PDF content for {filename} "
+            f"(runtime storage ready at {storage_path})."
+        )
         crew = StatelessCrew(agents=[evaluator], tasks=[task], memory=False, verbose=False)
-        _report_status(f"🤖 CrewAI: OpenRouter is reviewing representative PDF pages for {filename}.")
         output = crew.kickoff()
         raw_response = str(getattr(output, "raw", output))[:4000]
         try:
             validation = _pdf_validation_result(output, extraction_quality=extraction_quality)
         except ValueError:
-            _report_status("⚠️ Stage 2 parsing failed; requesting one JSON-only repair.")
+            _report_status("⚠️ Stage 2: Parse failed; requesting one JSON-only repair.")
             repair_task = Task(
                 description=("Return the previous evaluation as valid JSON only. No Markdown and no explanation. "
                              "Required fields: approved, score, confidence, needs_more_text, categories, reason.\n\n"
@@ -368,7 +375,7 @@ def evaluate_pdf_content(state: PdfValidationState) -> dict[str, dict[str, Any]]
                     extraction_quality=extraction_quality,
                 )
             except (ValueError, TypeError, json.JSONDecodeError) as exc:
-                _report_status("⚠️ Stage 2 parsing failed; document kept pending for later validation.")
+                _report_status("⚠️ Stage 2: Parse repair failed; document kept pending.")
                 validation = {
                     "status": "PENDING", "approved": False, "score": 0, "confidence": "low",
                     "needs_more_text": False, "categories": [], "reason": f"Stage 2 JSON parsing failed: {type(exc).__name__}",
@@ -381,7 +388,7 @@ def evaluate_pdf_content(state: PdfValidationState) -> dict[str, dict[str, Any]]
         ))
         strong_title = bool(re.search(r"ashrae|hvac|refrigeration|air[ _-]?conditioning", identity_evidence, re.IGNORECASE))
         if strong_title and validation["status"] == "REJECTED":
-            _report_status("⚠️ Stage 2 rejection conflicts with strong HVAC/ASHRAE metadata; retrying once.")
+            _report_status("⚠️ Stage 2: Rejection conflicts with strong HVAC/ASHRAE metadata; retrying once.")
             retry_output = StatelessCrew(agents=[evaluator], tasks=[task], memory=False, verbose=False).kickoff()
             raw_response = str(getattr(retry_output, "raw", retry_output))[:4000]
             try:
@@ -392,9 +399,12 @@ def evaluate_pdf_content(state: PdfValidationState) -> dict[str, dict[str, Any]]
                     validation = retry_validation
             except ValueError:
                 validation = {**validation, "status": "PENDING", "approved": False, "reason": "Conflicting Stage 2 result could not be reliably parsed; needs review"}
+        _report_status(
+            f"✅ CrewAI Stage 2: {validation['status']} · score {validation['score']} · {filename}"
+        )
         return {"validation": {**validation, "raw_response": raw_response}}
     except Exception as exc:
-        _report_status(f"⚠️ Stage 2 validation unavailable; document kept pending: {type(exc).__name__}")
+        _report_status(f"⚠️ Stage 2 unavailable; document kept pending: {type(exc).__name__}")
         return {"validation": {
             "status": "PENDING", "approved": False, "score": 0, "confidence": "low",
             "needs_more_text": False, "categories": [], "reason": f"Stage 2 validation error: {type(exc).__name__}",
