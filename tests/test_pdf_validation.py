@@ -9,6 +9,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.pdf_validation import (
+    completed_validation_report,
     scan_existing_pdfs,
     store_validated_pdf,
     validation_summary,
@@ -44,9 +45,14 @@ class PdfValidationStorageTests(unittest.TestCase):
             stored = store_validated_pdf(source, data_directory, approved=True)
             self.assertTrue(stored.is_file())
             self.assertFalse(source.exists())
+            write_validation_report(source, data_directory, {
+                "filename": stored.name, "source": "existing_pdf", "status": "APPROVED",
+                "approved": True, "stage2_completed": True, "stored_path": str(stored),
+            })
             summary = validation_summary(data_directory)
             self.assertEqual(summary["approved"], 1)
             self.assertEqual(summary["existing_pdf_approved"], 1)
+            self.assertIsNotNone(completed_validation_report(stored, data_directory))
 
     def test_pending_report_remains_eligible_for_a_later_validation(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

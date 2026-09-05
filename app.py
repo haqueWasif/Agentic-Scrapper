@@ -266,22 +266,68 @@ def _save_download_state(state: dict[str, Any]) -> None:
     os.replace(temporary_path, DOWNLOAD_STATE_FILE)
 
 
-def _update_download_state(filename: str, url: str, status: str, *, size: int | None = None, reason: str | None = None) -> None:
-    """Record one file's latest transfer state; safe for concurrent download workers."""
+def _update_download_state(
+    filename: str,
+    url: str,
+    status: str,
+    *,
+    size: int | None = None,
+    reason: str | None = None,
+    candidate: dict[str, Any] | None = None,
+    document_attempt: int | None = None,
+    request_attempt: int | None = None,
+    completed: bool | None = None,
+    retry_after_seconds: float | None = None,
+    validation_status: str | None = None,
+) -> None:
+    """Atomically record transfer and round-recovery state for one document."""
     with _DOWNLOAD_STATE_LOCK:
         state = _load_download_state()
         entry = state["downloads"].get(filename, {})
+        _, destination, part_path = _download_paths(filename)
+        current_size = int(size if size is not None else _download_size(filename))
+        previous_size = int(entry.get("bytes_downloaded", entry.get("size", 0)) or 0)
         entry.update({
             "filename": filename,
             "url": url or entry.get("url", ""),
             "status": status,
-            "size": int(size if size is not None else entry.get("size", 0)),
+            "size": current_size,
+            "bytes_downloaded": current_size,
+            "part_path": str(part_path),
+            "last_source": url or entry.get("last_source", entry.get("url", "")),
+            "last_progress_time": int(time.time()) if current_size > previous_size else entry.get("last_progress_time"),
+            "last_attempt_time": int(time.time()),
             "updated_at": int(time.time()),
         })
+        if candidate:
+            # Metadata is limited to the already-approved row information needed
+            # to refresh a mirror in a later recovery round or after an app restart.
+            entry["candidate"] = candidate
+            entry["document_id"] = str(candidate.get("document_id") or filename)
+            entry["title"] = str(candidate.get("title") or entry.get("title") or filename)
+            entry["query"] = str(candidate.get("query") or entry.get("query") or "")
+        if document_attempt is not None:
+            entry["document_attempt"] = int(document_attempt)
+        if request_attempt is not None:
+            entry["request_attempt"] = int(request_attempt)
+        if completed is not None:
+            entry["completed"] = bool(completed)
+        elif status.upper() == "COMPLETED":
+            entry["completed"] = True
+        elif status.upper() in {"QUEUED", "DOWNLOADING", "FAILED_FOR_ROUND", "RECOVERING", "PERMANENTLY_FAILED"}:
+            entry["completed"] = False
+        if retry_after_seconds is not None:
+            entry["retry_after_until"] = time.time() + max(0.0, float(retry_after_seconds))
+        elif status.upper() == "COMPLETED":
+            entry.pop("retry_after_until", None)
+        if validation_status is not None:
+            entry["validation_status"] = validation_status
         if reason:
             entry["reason"] = reason
+            entry["last_error"] = reason
         else:
             entry.pop("reason", None)
+            entry.pop("last_error", None)
         state["downloads"][filename] = entry
         _save_download_state(state)
 
@@ -299,8 +345,8 @@ def _completed_download_count() -> int:
     completed = 0
     for path in DOWNLOAD_DIRECTORY.glob("*.pdf"):
         entry = _download_state_entry(path.name)
-        if not entry or entry.get("status") != "completed":
-            _update_download_state(path.name, "", "completed", size=path.stat().st_size)
+        if not entry or str(entry.get("status", "")).upper() != "COMPLETED":
+            _update_download_state(path.name, "", "COMPLETED", size=path.stat().st_size, completed=True)
         completed += 1
     return completed
 
@@ -349,22 +395,28 @@ def download_file(direct_link, filename, referer_url, *, on_status=None, on_prog
         "Accept-Language": "en-US,en;q=0.9",
     }
     current_gateway = direct_link
-    retry_window_seconds = network.settings.retry_window_seconds if network else max(5, int(os.getenv("DOWNLOAD_RETRY_WINDOW_SECONDS", "1800")))
-    retry_deadline = time.monotonic() + retry_window_seconds
+    # REQUEST-LEVEL RETRY: this is intentionally bounded.  A worker returns
+    # control to the document scheduler after this small budget, where the
+    # document can be retried in a later recovery round without starving peers.
+    request_budget = (
+        network.settings.max_request_retries_per_attempt
+        if network else max(1, int(os.getenv("MAX_REQUEST_RETRIES_PER_ATTEMPT", "2")))
+    )
     temporary_attempt = 0
-    attempt = 0
+    request_attempt = 0
     transfer_started_at = time.monotonic()
     retry_origin_size = None
+    last_progress_time = transfer_started_at
 
     def retry_same_gateway(session, reason: str, current_size: int, *, refresh_cookies: bool = False) -> bool:
-        """Allow one cooldown retry; a second transient failure advances the queue."""
+        """Retry a short transient transfer only within this document attempt."""
         nonlocal temporary_attempt, retry_origin_size
-        if temporary_attempt >= 1:
+        if temporary_attempt + 1 >= request_budget:
             stall = retry_origin_size == current_size
             report(
                 f"Gateway unhealthy:\nURL: {current_gateway}\nExisting bytes: {current_size}\n"
                 f"Reason: {'download stalled after retry; no new bytes received' if stall else reason}\n"
-                "Action: second temporary failure; switch to the next health-ranked candidate."
+                "Action: request retry budget exhausted; preserve .part and schedule the document for the next recovery round."
             )
             record_state("partial" if part_file_path.exists() else "failed", f"gateway unhealthy: {reason}")
             return False
@@ -380,31 +432,33 @@ def download_file(direct_link, filename, referer_url, *, on_status=None, on_prog
         else:
             cookie_action = "retry same gateway"
 
-        temporary_attempt = 1
+        temporary_attempt += 1
         retry_origin_size = current_size
+        # Keep the proven short cooldown before one same-source Range retry.
+        # Longer document-level cooling happens between recovery rounds.
         retry_delay = random.randint(8, 15)
         record_state("partial" if part_file_path.exists() else "failed", reason)
         report(
             f"Download recovery:\nURL: {current_gateway}\nExisting bytes: {current_size}\n"
             f"Reason: {reason}\nAction: {cookie_action}\n"
             + (f"Range: bytes={current_size}-" if current_size else "Range: (none; no partial file yet)")
-            + f"\nNext retry: {retry_delay} seconds (same gateway recovery 1/1; HTTP/1.1 streaming enabled)."
+            + f"\nNext retry: {retry_delay} seconds (request retry {temporary_attempt + 1}/{request_budget}; HTTP/1.1 streaming enabled)."
         )
         time.sleep(retry_delay)
         return True
 
-    while time.monotonic() < retry_deadline:
+    while request_attempt < request_budget:
         existing_size = part_file_path.stat().st_size if part_file_path.exists() else 0
         report(f"TRACE .part detected={part_file_path.exists()}; path={part_file_path}; existing_size={existing_size}")
         bytes_downloaded = existing_size
         transfer_started = existing_size > 0
         if existing_size > 0:
             download_headers["Range"] = f"bytes={existing_size}-"
-            if attempt > 0:
+            if request_attempt > 0:
                 report(
                     f"Filename: {filename}\nGateway attempted: {direct_link}\n"
                     f"♻️ Found .part file after connection loss. Resuming via HTTP Range headers from byte {existing_size} "
-                    f"(request attempt {attempt + 1})."
+                    f"(request attempt {request_attempt + 1})."
                 )
             else:
                 report(f"♻️ Found .part file. Resuming download via HTTP Range headers from byte {existing_size}...")
@@ -412,12 +466,17 @@ def download_file(direct_link, filename, referer_url, *, on_status=None, on_prog
             if "Range" in download_headers:
                 del download_headers["Range"]
         try:
-            report(f"Transfer state: current_gateway={current_gateway}; bytes_downloaded={bytes_downloaded}; request_attempt={attempt + 1}")
+            report(f"Transfer state: current_gateway={current_gateway}; bytes_downloaded={bytes_downloaded}; request_attempt={request_attempt + 1}")
+            if state_updater:
+                state_updater(
+                    filename, direct_link, "DOWNLOADING", size=existing_size,
+                    request_attempt=request_attempt + 1, completed=False,
+                )
             with (nullcontext(network.session()) if network else c_requests.Session()) as s:
                 report(f"TRACE curl_cffi request: URL={direct_link}; Range={download_headers.get('Range', '(none)')}")
                 report(
                     f"🛡️ curl_cffi (chrome120): Initiating TLS connection to {direct_link} "
-                    f"(request attempt {attempt + 1}, connect timeout=15s, read timeout=60s, Referer={referer_url}, HTTP/1.1)..."
+                    f"(request attempt {request_attempt + 1}, connect timeout=15s, read timeout=60s, Referer={referer_url}, HTTP/1.1)..."
                 )
                 r = s.get(
                     direct_link, headers=download_headers, stream=True,
@@ -435,15 +494,36 @@ def download_file(direct_link, filename, referer_url, *, on_status=None, on_prog
                         network.gateway_result(direct_link, r.status_code)
                     reason = f"HTTP {r.status_code} after Range request" if existing_size else f"HTTP {r.status_code} before transfer"
                     if retry_same_gateway(s, reason, existing_size, refresh_cookies=r.status_code == 500):
-                        attempt += 1
+                        request_attempt += 1
                         continue
                     return "retry_next"
                 if r.status_code == 416:
                     report(f"Filename: {filename}\nGateway attempted: {direct_link}\nFailure reason: range not satisfied; restarting from scratch.")
                     if part_file_path.exists():
                         part_file_path.unlink()
-                    attempt += 1
+                    request_attempt += 1
                     continue
+                if r.status_code == 429:
+                    retry_after = r.headers.get("Retry-After", "")
+                    try:
+                        retry_after_seconds = max(0, int(float(retry_after)))
+                    except (TypeError, ValueError):
+                        retry_after_seconds = 0
+                    report(
+                        f"Gateway deferred:\nURL: {direct_link}\nReason: HTTP 429\n"
+                        f"Action: respecting access policy; document will wait for the next recovery round"
+                        + (f" (Retry-After: {retry_after}s)." if retry_after else ".")
+                    )
+                    if state_updater:
+                        state_updater(
+                            filename, direct_link, "partial" if part_file_path.exists() else "failed",
+                            size=_download_size(filename), reason=f"HTTP 429 Retry-After={retry_after}".strip(),
+                            retry_after_seconds=retry_after_seconds,
+                        )
+                    if network:
+                        network.result(proxy, False)
+                        network.gateway_result(direct_link, r.status_code)
+                    return "retry_next"
                 if r.status_code not in [200, 206]:
                     report(f"Gateway permanently failed:\nURL: {direct_link}\nReason: HTTP {r.status_code}\nAction: switch gateway without retrying this response.")
                     record_state("partial" if part_file_path.exists() else "failed", f"HTTP {r.status_code}")
@@ -458,7 +538,7 @@ def download_file(direct_link, filename, referer_url, *, on_status=None, on_prog
                             network.gateway_result(direct_link)
                         reason = f"HTML response (HTTP {r.status_code}) during PDF transfer"
                         if retry_same_gateway(s, reason, existing_size, refresh_cookies=r.status_code == 500):
-                            attempt += 1
+                            request_attempt += 1
                             continue
                         return "retry_next"
                     report(f"Gateway permanently failed:\nURL: {direct_link}\nReason: HTML challenge page (HTTP {r.status_code})\nAction: switch gateway.")
@@ -501,6 +581,7 @@ def download_file(direct_link, filename, referer_url, *, on_status=None, on_prog
                                 report(f"TRACE streaming first chunk: {len(chunk)} bytes")
                             pdf_file.write(chunk)
                             bytes_downloaded = pdf_file.tell()
+                            last_progress_time = time.monotonic()
                             if on_progress:
                                 on_progress(pdf_file.tell(), total_size)
 
@@ -545,13 +626,16 @@ def download_file(direct_link, filename, referer_url, *, on_status=None, on_prog
                 report(f"Filename: {filename}\nGateway attempted: {direct_link}\nFailure reason: {type(exc).__name__}: {exc}; no partial transfer to resume, trying next gateway.")
                 return "retry_next"
             bytes_downloaded = new_size
-            reason = f"{type(exc).__name__}: {exc}"
+            stalled = new_size == existing_size and time.monotonic() - last_progress_time >= (
+                network.settings.max_stall_seconds if network else 60
+            )
+            reason = "connection stalled without byte progress" if stalled else f"{type(exc).__name__}: {exc}"
             if retry_same_gateway(None, reason, bytes_downloaded):
-                attempt += 1
+                request_attempt += 1
                 continue
             return "retry_next"
-    record_state("partial" if part_file_path.exists() else "failed", "temporary retry window elapsed")
-    report(f"Filename: {filename}\nGateway attempted: {direct_link}\nTemporary retry window ({retry_window_seconds}s) elapsed; preserving .part and moving to next valid gateway.")
+    record_state("partial" if part_file_path.exists() else "failed", "request retry budget exhausted")
+    report(f"Filename: {filename}\nGateway attempted: {direct_link}\nRequest retry budget exhausted; preserving .part and returning control to the recovery scheduler.")
     return "retry_next"
 
 
@@ -882,7 +966,7 @@ def _bulk_candidates_from_page(
         _, destination, _ = _download_paths(filename)
         entry = _download_state_entry(filename)
         if destination.exists():
-            if not entry or entry.get("status") not in {"completed", "pending_validation"}:
+            if not entry or str(entry.get("status", "")).upper() != "COMPLETED":
                 _update_download_state(filename, str(document.get("link") or ""), "completed", size=destination.stat().st_size)
             skipped_completed += 1
             continue
@@ -893,12 +977,12 @@ def _bulk_candidates_from_page(
 
 
 def _validate_pdf_stage2(
-    file_path: Path, source: str, *, stage1_score: int | None = None, on_status=None,
+    file_path: Path, source: str, *, stage1_score: int | None = None, on_status=None, force: bool = False,
 ) -> dict[str, Any]:
     """Run conservative Stage 2 validation and preserve inconclusive files as pending."""
     report = on_status or logging.getLogger(__name__).info
     existing_report = completed_validation_report(file_path, DATA_DIRECTORY)
-    if existing_report:
+    if existing_report and not force:
         return existing_report
 
     report(f"📄 PyPDF: Sampling representative pages and metadata for Stage 2 validation: {file_path.name}")
@@ -995,8 +1079,8 @@ def _validate_pdf_stage2(
     )
     if source == "new_download":
         _update_download_state(
-            file_path.name, "", "completed" if status == "APPROVED" else "failed" if status == "REJECTED" else "pending_validation",
-            size=original_size, reason=validation_report["reason"],
+            file_path.name, "", "COMPLETED", size=original_size,
+            reason=validation_report["reason"], completed=True, validation_status=status,
         )
     return validation_report
 
@@ -1006,21 +1090,30 @@ def _schedule_validation(filename: str, *, stage1_score: int | None = 100) -> No
     _, destination, _ = _download_paths(filename)
     if not destination.exists():
         return
-    _update_download_state(filename, "", "pending_validation", size=destination.stat().st_size)
+    _update_download_state(
+        filename, "", "COMPLETED", size=destination.stat().st_size,
+        completed=True, validation_status="PENDING",
+    )
     logging.getLogger(__name__).info("Validation queued for %s", filename)
 
     def validate() -> None:
         try:
             _validate_pdf_stage2(destination, "new_download", stage1_score=stage1_score)
         except Exception as exc:
-            _update_download_state(filename, "", "pending_validation", size=_download_size(filename), reason=f"validation error: {type(exc).__name__}")
+            _update_download_state(
+                filename, "", "COMPLETED", size=_download_size(filename), completed=True,
+                validation_status="PENDING", reason=f"validation error: {type(exc).__name__}",
+            )
             logging.getLogger(__name__).warning("Validation pending for %s: %s", filename, type(exc).__name__)
 
     future = _VALIDATION_EXECUTOR.submit(validate)
 
     def mark_pending_if_slow() -> None:
         if not future.done():
-            _update_download_state(filename, "", "pending_validation", size=_download_size(filename), reason="validation exceeded timeout")
+            _update_download_state(
+                filename, "", "COMPLETED", size=_download_size(filename), completed=True,
+                validation_status="PENDING", reason="validation exceeded timeout",
+            )
             logging.getLogger(__name__).info("Validation timed out for %s; left pending", filename)
 
     timer = threading.Timer(VALIDATION_TIMEOUT_SECONDS, mark_pending_if_slow)
@@ -1033,10 +1126,10 @@ def scan_and_validate_existing_pdfs(on_status, *, revalidate: bool = False) -> d
     candidates = scan_existing_pdfs(DATA_DIRECTORY, revalidate=revalidate)
     on_status(f"📂 Existing PDF Scan: Found {len(candidates)} PDF(s) requiring Stage 2 validation.")
     approved = rejected = pending = 0
-    for candidate in candidates:
+    for index, candidate in enumerate(candidates, start=1):
         try:
             validation = _validate_pdf_stage2(
-                Path(candidate["filepath"]), "existing_pdf", on_status=on_status,
+                Path(candidate["filepath"]), "existing_pdf", on_status=on_status, force=revalidate,
             )
             if validation["status"] == "APPROVED":
                 approved += 1
@@ -1047,6 +1140,10 @@ def scan_and_validate_existing_pdfs(on_status, *, revalidate: bool = False) -> d
         except Exception as exc:
             pending += 1
             on_status(f"⚠️ Stage 2 could not validate {candidate['filename']}: {type(exc).__name__}")
+        on_status(
+            f"Stage 2 Validation progress: Processed {index} / {len(candidates)} · "
+            f"Approved {approved} · Rejected {rejected} · Pending/Error {pending}"
+        )
     return {"found": len(candidates), "processed": approved + rejected + pending, "approved": approved, "rejected": rejected, "pending": pending}
 
 
@@ -1077,85 +1174,245 @@ async def _download_bulk_cards(candidates: list[dict[str, Any]], debug) -> int:
     return completed
 
 
-def _download_worker(candidate: dict[str, Any], network: NetworkManager, worker_id: int) -> bool:
-    """Worker-only transfer path; Streamlit rendering remains on the main thread."""
+def _recovery_candidates(query: str) -> list[dict[str, Any]]:
+    """Rebuild interrupted approved jobs without repeating search or Stage 1."""
+    normalized_query = query.strip().lower()
+    recovered: list[dict[str, Any]] = []
+    with _DOWNLOAD_STATE_LOCK:
+        state = _load_download_state()
+        changed = False
+        for filename, entry in state["downloads"].items():
+            if not isinstance(entry, dict):
+                continue
+            status = str(entry.get("status", "")).upper()
+            candidate = entry.get("candidate")
+            if status == "DOWNLOADING":
+                # A process cannot retain a live worker across a Streamlit/app
+                # restart.  Its on-disk .part remains the recovery source of truth.
+                entry["status"] = "FAILED_FOR_ROUND"
+                entry["last_error"] = "stale DOWNLOADING state recovered after restart"
+                status = "FAILED_FOR_ROUND"
+                changed = True
+            if status not in {"QUEUED", "FAILED_FOR_ROUND", "RECOVERING", "PARTIAL", "FAILED"}:
+                continue
+            if not isinstance(candidate, dict) or not candidate.get("mirrors"):
+                continue
+            if entry.get("query", "").strip().lower() not in {"", normalized_query}:
+                continue
+            _, destination, _ = _download_paths(filename)
+            if destination.exists():
+                entry["status"] = "COMPLETED"
+                entry["completed"] = True
+                entry["size"] = destination.stat().st_size
+                changed = True
+                continue
+            job = dict(candidate)
+            job["filename"] = filename
+            job["_document_attempt"] = max(1, int(entry.get("document_attempt", 0) or 0) + 1)
+            recovered.append(job)
+        if changed:
+            _save_download_state(state)
+    return recovered
+
+
+def _download_worker(candidate: dict[str, Any], network: NetworkManager, worker_id: int) -> dict[str, Any]:
+    """Perform one bounded document-level attempt; never render Streamlit here."""
     filename = candidate["filename"]
+    document_attempt = int(candidate.get("_document_attempt", 1) or 1)
+    max_attempts = network.settings.max_document_attempts
+    state_candidate = {key: value for key, value in candidate.items() if not key.startswith("_")}
+    _update_download_state(
+        filename, candidate.get("source_url", ""), "DOWNLOADING", size=_download_size(filename),
+        candidate=state_candidate, document_attempt=document_attempt, request_attempt=0, completed=False,
+    )
     proxy = network.begin_download(worker_id, filename)
 
     def status(message: str) -> None:
         network.emit("status", worker_id, filename, message)
 
     def progress(downloaded: int, total: int | None) -> None:
+        _update_download_state(
+            filename, candidate.get("source_url", ""), "DOWNLOADING", size=downloaded,
+            candidate=state_candidate, document_attempt=document_attempt,
+        )
         network.emit("progress", worker_id, filename, downloaded=downloaded, total=total or 0)
 
-    for mirror_attempt, mirror in enumerate(candidate["mirrors"], start=1):
-        result = parse_mirror_and_download(
-            mirror, filename, needs_page_check=False, on_status=status,
-            on_progress=progress, network=network, worker_id=worker_id, proxy=proxy,
-        )
-        if result is True:
-            _schedule_validation(filename, stage1_score=candidate.get("stage1_score", 100))
-            network.emit("success", worker_id, filename, "Downloaded successfully; Stage 2 PDF validation queued.")
-            return True
-        if result == "retry_next":
-            network.cooldown(mirror_attempt)
-    network.emit("failure", worker_id, filename, "All valid gateways failed.")
-    return False
+    status(
+        f"⬇️ {'Recovery' if document_attempt > 1 else 'Primary'} download attempt "
+        f"{document_attempt}/{max_attempts}; existing partial: {_download_size(filename) / (1024 * 1024):.2f} MB."
+    )
+    last_reason = "all valid gateways failed"
+    try:
+        for mirror_attempt, mirror in enumerate(candidate["mirrors"], start=1):
+            result = parse_mirror_and_download(
+                mirror, filename, needs_page_check=False, on_status=status,
+                on_progress=progress, network=network, worker_id=worker_id, proxy=proxy,
+            )
+            if result is True:
+                _update_download_state(
+                    filename, candidate.get("source_url", ""), "COMPLETED", size=_download_size(filename),
+                    candidate=state_candidate, document_attempt=document_attempt, completed=True,
+                )
+                _schedule_validation(filename, stage1_score=candidate.get("stage1_score", 100))
+                network.emit("success", worker_id, filename, "Downloaded successfully; Stage 2 PDF validation queued.")
+                return {"success": True, "candidate": candidate, "attempt": document_attempt}
+            if result == "retry_next":
+                last_reason = f"source {mirror_attempt} did not complete within its request retry budget"
+                state_entry = _download_state_entry(filename) or {}
+                if str(state_entry.get("last_error", "")).startswith("HTTP 429"):
+                    # Do not use another route to evade a source's explicit rate
+                    # limit.  The scheduler will wait through Retry-After.
+                    last_reason = str(state_entry.get("last_error"))
+                    break
+                network.cooldown(mirror_attempt)
+    except Exception as exc:
+        last_reason = f"{type(exc).__name__}: {exc}"
+
+    final_status = "PERMANENTLY_FAILED" if document_attempt >= max_attempts else "FAILED_FOR_ROUND"
+    _update_download_state(
+        filename, candidate.get("source_url", ""), final_status, size=_download_size(filename),
+        reason=last_reason, candidate=state_candidate, document_attempt=document_attempt, completed=False,
+    )
+    action = "permanent failure limit reached" if final_status == "PERMANENTLY_FAILED" else "scheduled for next recovery round"
+    network.emit(
+        "failure", worker_id, filename,
+        f"⚠️ Download attempt ended\nDocument: {filename}\nAttempt: {document_attempt}/{max_attempts}\n"
+        f"Downloaded: {_download_size(filename) / (1024 * 1024):.2f} MB\nReason: {last_reason}\nAction: {action}",
+    )
+    state_entry = _download_state_entry(filename) or {}
+    return {
+        "success": False, "candidate": candidate, "attempt": document_attempt,
+        "permanent": final_status == "PERMANENTLY_FAILED",
+        "retry_after_until": float(state_entry.get("retry_after_until", 0) or 0),
+    }
 
 
-async def _download_concurrent_cards(candidates: list[dict[str, Any]], network: NetworkManager, debug) -> tuple[int, list[str]]:
-    """Run at most three downloads concurrently and consume telemetry on the UI thread."""
+async def _download_concurrent_cards(
+    candidates: list[dict[str, Any]], network: NetworkManager, debug, *, executor: ThreadPoolExecutor | None = None,
+) -> tuple[int, list[str]]:
+    """Run bounded primary/recovery rounds using one fixed worker pool.
+
+    Request-level retries happen inside ``download_file``.  This scheduler only
+    retries a document after every current-round document has released its worker.
+    """
     if not candidates:
         return 0, []
-    cards = {}
+    unique_candidates: list[dict[str, Any]] = []
+    seen_filenames: set[str] = set()
     for candidate in candidates:
+        filename = candidate["filename"]
+        if filename not in seen_filenames:
+            seen_filenames.add(filename)
+            unique_candidates.append(dict(candidate))
+    cards = {}
+    for candidate in unique_candidates:
         filename = candidate["filename"]
         with st.status(f"⬇️ Processing: {filename[:40]}...", expanded=False) as card:
             card.write("⏳ Queued for a controlled curl_cffi worker...")
             cards[filename] = (card, st.empty())
-    completed, failed = 0, []
-    with ThreadPoolExecutor(max_workers=network.settings.max_workers, thread_name_prefix="pdf-download") as executor:
-        pending = {
-            executor.submit(_download_worker, candidate, network, (index % network.settings.max_workers) + 1): candidate
-            for index, candidate in enumerate(candidates)
-        }
-        while pending:
-            while True:
-                try:
-                    event = network.events.get_nowait()
-                except Empty:
-                    break
-                card, progress = cards[event["filename"]]
-                if event["kind"] == "progress":
-                    total = event["total"]
-                    transferred = event["downloaded"]
-                    fraction = min(transferred / total, 1.0) if total else 0.0
-                    progress.progress(fraction, text=f"Worker {event['worker']}/{network.settings.max_workers}: {transferred / (1024 * 1024):.2f} MB" + (f" / {total / (1024 * 1024):.2f} MB" if total else ""))
-                elif event["kind"] == "status":
-                    card.write(event["message"])
-                elif event["kind"] == "success":
-                    card.write(event["message"])
-                elif event["kind"] == "failure":
-                    card.write(event["message"])
-            done, _ = wait(pending, timeout=0.2, return_when=FIRST_COMPLETED)
-            for future in done:
-                candidate = pending.pop(future)
-                filename = candidate["filename"]
-                card, progress = cards[filename]
-                progress.empty()
-                try:
-                    if future.result():
+
+    completed, failed, recovered_successfully, permanent_failures = 0, [], 0, 0
+    round_number = 1
+    current_round = unique_candidates
+    executor_context = nullcontext(executor) if executor else ThreadPoolExecutor(
+        max_workers=network.settings.max_workers, thread_name_prefix="pdf-download",
+    )
+    with executor_context as active_executor:
+        while current_round:
+            for candidate in current_round:
+                candidate.setdefault("_document_attempt", 1 if round_number == 1 else 2)
+                _update_download_state(
+                    candidate["filename"], candidate.get("source_url", ""),
+                    "RECOVERING" if round_number > 1 else "QUEUED", size=_download_size(candidate["filename"]),
+                    candidate={key: value for key, value in candidate.items() if not key.startswith("_")},
+                    document_attempt=int(candidate["_document_attempt"]), completed=False,
+                )
+            st.caption(
+                f"Download Round: {round_number} · Configured Workers: {network.settings.max_workers} · "
+                f"Active Workers: {min(network.settings.max_workers, len(current_round))} · "
+                f"Completed: {completed} · Recovery queue: {len(current_round) if round_number > 1 else 0} · "
+                f"Recovered successfully: {recovered_successfully} · Permanent failures: {permanent_failures}"
+            )
+            pending = {
+                active_executor.submit(
+                    _download_worker, candidate, network, (index % network.settings.max_workers) + 1,
+                ): candidate
+                for index, candidate in enumerate(current_round)
+            }
+            failed_for_round: list[dict[str, Any]] = []
+            recovery_not_before = 0.0
+            while pending:
+                while True:
+                    try:
+                        event = network.events.get_nowait()
+                    except Empty:
+                        break
+                    if event["filename"] not in cards:
+                        continue
+                    card, progress = cards[event["filename"]]
+                    if event["kind"] == "progress":
+                        total = event["total"]
+                        transferred = event["downloaded"]
+                        fraction = min(transferred / total, 1.0) if total else 0.0
+                        progress.progress(fraction, text=f"Worker {event['worker']}/{network.settings.max_workers}: {transferred / (1024 * 1024):.2f} MB" + (f" / {total / (1024 * 1024):.2f} MB" if total else ""))
+                    else:
+                        card.write(event["message"])
+                done, _ = wait(pending, timeout=0.2, return_when=FIRST_COMPLETED)
+                for future in done:
+                    candidate = pending.pop(future)
+                    filename = candidate["filename"]
+                    card, progress = cards[filename]
+                    progress.empty()
+                    try:
+                        result = future.result()
+                    except Exception:
+                        result = {"success": False, "candidate": candidate, "attempt": int(candidate.get("_document_attempt", 1)), "permanent": False}
+                        debug(f"Filename: {filename}\nFailure reason:\n{traceback.format_exc()}")
+                    if result["success"]:
                         completed += 1
+                        if int(result["attempt"]) > 1:
+                            recovered_successfully += 1
                         card.update(label=f"✅ Secured: {filename[:40]}", state="complete", expanded=False)
                         debug(f"Filename: {filename}\nDownloaded successfully")
-                    else:
-                        failed.extend(candidate["mirrors"])
+                    elif result.get("permanent"):
+                        _update_download_state(
+                            filename, candidate.get("source_url", ""), "PERMANENTLY_FAILED",
+                            size=_download_size(filename), candidate={key: value for key, value in candidate.items() if not key.startswith("_")},
+                            document_attempt=int(result["attempt"]), completed=False,
+                        )
+                        permanent_failures += 1
+                        failed.extend(candidate.get("mirrors", []))
                         card.update(label=f"❌ Failed: {filename[:40]}", state="error", expanded=False)
-                except Exception:
-                    failed.extend(candidate["mirrors"])
-                    debug(f"Filename: {filename}\nFailure reason:\n{traceback.format_exc()}")
-                    card.update(label=f"❌ Failed: {filename[:40]}", state="error", expanded=False)
-            await asyncio.sleep(0)
+                    else:
+                        _update_download_state(
+                            filename, candidate.get("source_url", ""), "FAILED_FOR_ROUND",
+                            size=_download_size(filename), candidate={key: value for key, value in candidate.items() if not key.startswith("_")},
+                            document_attempt=int(result["attempt"]), completed=False,
+                        )
+                        failed.extend(candidate.get("mirrors", []))
+                        next_candidate = dict(result["candidate"])
+                        next_candidate["_document_attempt"] = int(result["attempt"]) + 1
+                        failed_for_round.append(next_candidate)
+                        recovery_not_before = max(recovery_not_before, float(result.get("retry_after_until", 0) or 0))
+                        card.update(label=f"⚠️ Pending recovery: {filename[:40]}", state="running", expanded=False)
+                await asyncio.sleep(0)
+
+            # DOCUMENT-LEVEL RECOVERY: never recycle a failed file until every
+            # file in this round has had an opportunity to use a worker.
+            if not failed_for_round:
+                break
+            delay = max(network.settings.recovery_round_delay_seconds, recovery_not_before - time.time())
+            st.caption(
+                f"♻️ Recovery queue ready: {len(failed_for_round)} document(s). "
+                f"Waiting {delay:g}s before the next round."
+            )
+            await asyncio.sleep(delay)
+            current_round = failed_for_round
+            round_number += 1
+    st.caption(
+        f"Download run finished · Completed: {completed} · Recovered: {recovered_successfully} · "
+        f"Permanently failed: {permanent_failures}"
+    )
     return completed, failed
 
 
@@ -1275,6 +1532,12 @@ async def run_scraping_pipeline(
     failed_urls: list[str] = []
     debug_events: list[str] = []
     network = NetworkManager(PROJECT_ROOT)
+    # One fixed pool serves primary and automatic recovery rounds for this run.
+    # Individual document failures release their future; the pool is not rebuilt.
+    download_executor = ThreadPoolExecutor(
+        max_workers=network.settings.max_workers, thread_name_prefix="pdf-download",
+    )
+    scheduled_filenames: set[str] = set()
 
     def debug(message: str) -> None:
         debug_events.append(message)
@@ -1284,6 +1547,19 @@ async def run_scraping_pipeline(
 
     with pipeline_area:
         with st.status("🤖 Agentic Pipeline Initialized...", expanded=True) as main_status:
+            restart_recovery_jobs = _recovery_candidates(query)
+            if restart_recovery_jobs:
+                main_status.write(
+                    f"♻️ Restored {len(restart_recovery_jobs)} interrupted download(s); "
+                    "resuming their existing .part files before new retrieval."
+                )
+                scheduled_filenames.update(job["filename"] for job in restart_recovery_jobs)
+                with downloads_area:
+                    completed_now, failed_now = await _download_concurrent_cards(
+                        restart_recovery_jobs, network, debug, executor=download_executor,
+                    )
+                documents_downloaded += completed_now
+                failed_urls.extend(failed_now)
             for page_number in range(1, max_pages + 1):
                 if documents_downloaded >= target_documents:
                     debug(f"Target of {target_documents} completed files reached; stopping page collection.")
@@ -1459,6 +1735,8 @@ async def run_scraping_pipeline(
                     _, destination, _ = _download_paths(filename)
                     if destination.exists():
                         main_status.write(f"📂 Already stored: {filename}; skipping download.")
+                    elif filename in scheduled_filenames:
+                        main_status.write(f"♻️ Existing recovery state retained for: {filename}; avoiding a duplicate worker assignment.")
                     elif not mirror_links:
                         failed_urls.append(str(document.get("link") or "missing document link"))
                         with st.status(f"⬇️ Processing: {filename[:40]}...", expanded=False) as missing_status:
@@ -1474,9 +1752,15 @@ async def run_scraping_pipeline(
                             "mirrors": mirror_links,
                             "source_url": str(document.get("link") or ""),
                             "stage1_score": stage1_score,
+                            "document_id": str(document.get("id") or filename),
+                            "title": title,
+                            "query": query.strip(),
                         })
+                        scheduled_filenames.add(filename)
                 with downloads_area:
-                    completed_now, failed_now = await _download_concurrent_cards(download_jobs, network, debug)
+                    completed_now, failed_now = await _download_concurrent_cards(
+                        download_jobs, network, debug, executor=download_executor,
+                    )
                     documents_downloaded += completed_now
                     failed_urls.extend(failed_now)
 
@@ -1514,6 +1798,7 @@ async def run_scraping_pipeline(
             st.write("Document download outcomes:")
             st.code("\n\n".join(download_events))
 
+    download_executor.shutdown(wait=True)
     network.close()
     stage2_totals = validation_summary(DATA_DIRECTORY)
     return {

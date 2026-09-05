@@ -17,12 +17,16 @@ from curl_cffi import requests as c_requests
 @dataclass(frozen=True)
 class NetworkSettings:
     proxy_enabled: bool = False
-    max_workers: int = 3
+    max_workers: int = 5
     retry_limit: int = 5
     retry_window_seconds: int = 1800
     cooldown_enabled: bool = True
     new_download_min_seconds: float = 2.0
     new_download_max_seconds: float = 6.0
+    max_request_retries_per_attempt: int = 2
+    max_stall_seconds: int = 60
+    max_document_attempts: int = 5
+    recovery_round_delay_seconds: float = 5.0
 
 
 class NetworkManager:
@@ -61,12 +65,16 @@ class NetworkManager:
                 return default
         return NetworkSettings(
             proxy_enabled=boolean("proxy_enabled", False),
-            max_workers=max(1, min(3, int(number("max_workers", 3)))),
+            max_workers=max(1, min(5, int(number("max_workers", 5)))),
             retry_limit=max(1, int(number("retry_limit", 5))),
             retry_window_seconds=max(60, int(number("retry_window_seconds", 1800))),
             cooldown_enabled=boolean("cooldown_enabled", True),
             new_download_min_seconds=max(0, number("new_download_min_seconds", 2)),
             new_download_max_seconds=max(0, number("new_download_max_seconds", 6)),
+            max_request_retries_per_attempt=max(1, int(number("max_request_retries_per_attempt", 2))),
+            max_stall_seconds=max(1, int(number("max_stall_seconds", 60))),
+            max_document_attempts=max(1, int(number("max_document_attempts", 5))),
+            recovery_round_delay_seconds=max(0, number("recovery_round_delay_seconds", 5)),
         )
 
     @staticmethod

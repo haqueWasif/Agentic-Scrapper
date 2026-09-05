@@ -33,8 +33,29 @@ def _report_key(file_path: Path) -> str:
     return hashlib.sha256(str(file_path.resolve()).encode("utf-8")).hexdigest()
 
 
+def _matching_report_path(file_path: Path, data_directory: Path) -> Path | None:
+    """Find a report after a validated PDF has moved into approved/rejected."""
+    target = file_path.resolve()
+    for report_path in validation_directories(data_directory)["reports"].glob("*.json"):
+        try:
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        for key in ("filepath", "stored_path"):
+            value = report.get(key)
+            if value:
+                try:
+                    if Path(str(value)).resolve() == target:
+                        return report_path
+                except OSError:
+                    continue
+    return None
+
+
 def validation_report_path(file_path: Path, data_directory: Path) -> Path:
-    return validation_directories(data_directory)["reports"] / f"{_report_key(file_path)}.json"
+    return _matching_report_path(file_path, data_directory) or (
+        validation_directories(data_directory)["reports"] / f"{_report_key(file_path)}.json"
+    )
 
 
 def completed_validation_report(file_path: Path, data_directory: Path) -> dict[str, Any] | None:
