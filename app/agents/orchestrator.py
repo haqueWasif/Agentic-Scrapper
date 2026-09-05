@@ -11,6 +11,7 @@ from typing import Any, Callable, TypedDict
 from crewai import Agent, Crew, LLM, Task
 from dotenv import load_dotenv
 from langgraph.graph import END, START, StateGraph
+from app.observability import trace_operation
 from app.agents.storage import StatelessCrew, prepare_storage
 
 
@@ -429,7 +430,28 @@ async def invoke_scraper_graph(
             on_status(message)
 
     try:
-        task = asyncio.create_task(asyncio.to_thread(scraper_graph.invoke, state))
+        def run_graph() -> dict[str, Any]:
+            documents = state.get("document_batch") or []
+            observe = globals().get("trace_operation")
+            if not callable(observe):  # Supports isolated/offline graph tests.
+                return scraper_graph.invoke(state)
+            return observe(
+                "ASHRAE-Stage1-Metadata-Evaluation",
+                inputs={
+                    "workflow": "stage1_crewai_evaluation",
+                    "document_count": len(documents),
+                    "metadata_character_count": min(
+                        12000, sum(len(str(document.get("text", ""))) for document in documents),
+                    ),
+                },
+                operation=lambda: scraper_graph.invoke(state),
+                summarize_output=lambda output: {
+                    "approved_document_count": len(output.get("extracted_documents", [])),
+                    "error_status": False,
+                },
+            )
+
+        task = asyncio.create_task(asyncio.to_thread(run_graph))
         while not task.done():
             await asyncio.wait({task}, timeout=0.1)
             drain_messages()
@@ -453,7 +475,31 @@ async def invoke_pdf_validation_graph(
                 break
 
     try:
-        task = asyncio.create_task(asyncio.to_thread(pdf_validation_graph.invoke, state))
+        def run_graph() -> dict[str, Any]:
+            observe = globals().get("trace_operation")
+            if not callable(observe):  # Supports isolated/offline graph tests.
+                return pdf_validation_graph.invoke(state)
+            return observe(
+                "ASHRAE-Stage2-PDF-Validation",
+                inputs={
+                    "workflow": "stage2_crewai_pdf_validation",
+                    "filename": str(state.get("filename") or "Unknown PDF"),
+                    "pages_sampled": list(state.get("pages_sampled") or [])[:10],
+                    "page_count": int(state.get("page_count") or 0),
+                    "extraction_quality": str(state.get("extraction_quality") or "empty"),
+                    "preview_character_count": min(12000, len(str(state.get("pdf_text") or ""))),
+                },
+                operation=lambda: pdf_validation_graph.invoke(state),
+                summarize_output=lambda output: {
+                    "status": str((output.get("validation") or {}).get("status") or "PENDING"),
+                    "score": int((output.get("validation") or {}).get("score") or 0),
+                    "confidence": str((output.get("validation") or {}).get("confidence") or "unknown"),
+                    "categories": list((output.get("validation") or {}).get("categories") or [])[:12],
+                    "error_status": False,
+                },
+            )
+
+        task = asyncio.create_task(asyncio.to_thread(run_graph))
         while not task.done():
             await asyncio.wait({task}, timeout=0.1)
             drain_messages()

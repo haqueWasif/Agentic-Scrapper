@@ -9,6 +9,7 @@ python-dotenv>=1.0.0
 
 # Shared foundations for API access, validation, and future LLM integration.
 langchain-openai>=0.2.0
+langsmith>=0.1.0
 # CrewAI's OpenRouter provider uses LiteLLM.
 litellm
 openai>=1.50.0
