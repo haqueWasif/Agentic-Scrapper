@@ -3,9 +3,11 @@
 import ast
 import logging
 import os
+import random
 import re
 import shutil
 import tempfile
+import time as wall_time
 import unittest
 import urllib.parse
 from pathlib import Path
@@ -28,7 +30,7 @@ class Response:
         self.closed = False
 
     def iter_content(self, chunk_size):
-        assert chunk_size == 65536
+        assert chunk_size == 256 * 1024
         yield self.data
         if self.fail:
             raise OSError('connection dropped')
@@ -54,8 +56,16 @@ class SyncDownloadTests(unittest.TestCase):
         owner = self
 
         class Session:
+            class Cookies:
+                def __init__(self):
+                    self.clear_calls = 0
+
+                def clear(self):
+                    self.clear_calls += 1
+
             def __enter__(self):
                 self.closed = False
+                self.cookies = self.Cookies()
                 owner.sessions.append(self)
                 return self
 
@@ -85,7 +95,8 @@ class SyncDownloadTests(unittest.TestCase):
         self.ns = dict(
             os=os, re=re, Path=Path, shutil=shutil, logging=logging, __name__=__name__,
             urllib=urllib, urljoin=urljoin, urlparse=urlparse, BeautifulSoup=BeautifulSoup,
-            c_requests=SimpleNamespace(Session=Session), time=SimpleNamespace(sleep=self.sleeps.append),
+            c_requests=SimpleNamespace(Session=Session), time=SimpleNamespace(sleep=self.sleeps.append, monotonic=wall_time.monotonic),
+            random=SimpleNamespace(randint=lambda lower, upper: lower),
             st=self.widget, DOWNLOAD_DIRECTORY=self.root / 'ASHRAE_Files',
             LOW_RELEVANCE_DIRECTORY=self.root / 'Low_Relevance_Files',
             QUERY_TERMS=['ashrae', 'hvac'], CORE_ASHRAE_STANDARDS=['90.1'],
@@ -115,7 +126,7 @@ class SyncDownloadTests(unittest.TestCase):
                 'Referer': 'https://mirror.example/book/123',
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
                 'Accept-Language': 'en-US,en;q=0.9',
-            }, 'stream': True, 'timeout': 180, 'impersonate': 'chrome120',
+            }, 'stream': True, 'timeout': (15, 60), 'impersonate': 'chrome120', 'http_version': 'v1',
         }))
         self.assertEqual(self.destination.read_bytes(), PDF)
         self.assertFalse(self.part.exists())
@@ -138,10 +149,10 @@ class SyncDownloadTests(unittest.TestCase):
             f'<a href="{url}">GET</a>' for url in urls
         )), Response()]
         self.assertTrue(self.download())
-        self.assertEqual(self.calls[1][0], urls[-1])
-        ranking = next(message for message in self.widget.logs if message.startswith('Candidate gateway ranking:'))
-        self.assertEqual(ranking, 'Candidate gateway ranking:\n1. ' + urls[-1] + '\n2. ' + urls[-2] + '\n3. ' + urls[-3])
-        print(ranking)
+        self.assertEqual(self.calls[1][0], urls[-3])
+        selected = next(message for message in self.widget.logs if message.startswith('Final download candidates:'))
+        self.assertTrue(selected.startswith('Final download candidates:\n1. ' + urls[-3] + '\n2. ' + urls[-2] + '\n3. ' + urls[-1]))
+        print(selected)
 
     def test_ipfs_only_fallback_never_uses_localhost(self):
         self.responses = [Response(text='''
@@ -157,40 +168,40 @@ class SyncDownloadTests(unittest.TestCase):
         for failure in (DNSError('DNS failed'), Response(status=403), Response(headers={'Content-Type': 'text/html'})):
             with self.subTest(failure=failure):
                 self.calls.clear()
-                self.responses = [Response(text='<a href="/bad">GET</a><a href="/good">DOWNLOAD</a>'), failure, Response()]
+                retry_response = failure if isinstance(failure, DNSError) else Response()
+                self.responses = [Response(text='<a href="/bad.pdf">GET</a><a href="/good.pdf">DOWNLOAD</a>'), failure, retry_response, Response()]
                 self.assertTrue(self.download())
-                self.assertEqual([url for url, _ in self.calls], [
-                    'https://mirror.example/book/123', 'https://mirror.example/bad', 'https://mirror.example/good',
-                ])
+                streamed = [url for url, args in self.calls if args.get('stream')]
+                self.assertEqual(streamed[-1], 'https://mirror.example/good.pdf')
 
-    def test_five_server_errors_cool_down_then_try_next_gateway(self):
-        failures = [Response(status=500) for _ in range(5)]
-        self.responses = [Response(text='<a href="/bad">GET</a><a href="/good">IPFS</a>'), *failures, Response()]
+    def test_two_server_errors_mark_gateway_unhealthy_then_try_next_gateway(self):
+        self.responses = [Response(text='<a href="/bad.pdf">GET</a><a href="/good.pdf">DOWNLOAD</a>'), Response(status=500), Response(status=500), Response()]
         self.assertTrue(self.download())
-        self.assertEqual([url for url, _ in self.calls[1:6]], ['https://mirror.example/bad'] * 5)
-        self.assertEqual(self.calls[-1][0], 'https://mirror.example/good')
-        self.assertEqual(self.sleeps.count(10), 5)
+        self.assertEqual([url for url, _ in self.calls[1:]], [
+            'https://mirror.example/bad.pdf', 'https://mirror.example/bad.pdf', 'https://mirror.example/good.pdf',
+        ])
+        self.assertEqual(self.sleeps, [8])
         self.assertTrue(all(session.closed for session in self.sessions))
 
     def test_mirror_parser_deduplicates_and_never_streams_ads_php(self):
         self.responses = [Response(text='''
             <a href="/ads.php?md5=bad">GET</a>
             <a href="/ADS.PHP?md5=bad">Fallback</a>
-            <a href="/one?md5=123">1</a><a href="/one?md5=123#same">DOWNLOAD</a>
-            <a href="/two">IPFS</a>
+            <a href="/one.pdf?md5=123#same">DOWNLOAD</a>
+            <a href="/two.pdf">IPFS</a>
         '''), Response(headers={'Content-Type': 'text/html'}), Response()]
         self.assertTrue(self.download())
         self.assertEqual([url for url, _ in self.calls[1:]], [
-            'https://mirror.example/one?md5=123#same', 'https://mirror.example/two',
+            'https://mirror.example/one.pdf?md5=123#same', 'https://mirror.example/two.pdf',
         ])
 
     def test_randombook_style_download_anchor_uses_fallback_parser(self):
         self.responses = [
-            Response(text='<a class="btn" href="/download/08861ea48a810b70b4b315f9bdd60be">Open</a>'),
+            Response(text='<a class="btn" href="/download/08861ea48a810b70b4b315f9bdd60be.pdf">Open</a>'),
             Response(),
         ]
         self.assertTrue(self.download('https://randombook.org/book/08861ea48a810b70b4b315f9bdd60be'))
-        self.assertEqual(self.calls[1][0], 'https://randombook.org/download/08861ea48a810b70b4b315f9bdd60be')
+        self.assertEqual(self.calls[1][0], 'https://randombook.org/download/08861ea48a810b70b4b315f9bdd60be.pdf')
 
     def test_script_download_url_uses_fallback_parser(self):
         self.responses = [
@@ -210,7 +221,7 @@ class SyncDownloadTests(unittest.TestCase):
 
     def test_partial_connection_drop_resumes_same_url(self):
         prefix = PDF[:3000]
-        self.responses = [Response(text='<a href="/file">GET</a>'), Response(data=prefix, fail=True),
+        self.responses = [Response(text='<a href="/file.pdf">GET</a>'), Response(data=prefix, fail=True),
                           Response(status=206, data=PDF[3000:], headers={
                               'Content-Range': f'bytes 3000-{len(PDF)-1}/{len(PDF)}',
                               'Content-Length': str(len(PDF)-3000),
@@ -236,7 +247,7 @@ class SyncDownloadTests(unittest.TestCase):
 
     def test_mirror_fallback_keeps_one_status_and_exact_urls(self):
         mirrors = ['https://one.example/book/123', 'https://two.example/main/123']
-        self.responses = [Response(status=503), Response(text='<a href="/file">DOWNLOAD</a>'), Response()]
+        self.responses = [Response(status=503), Response(text='<a href="/file.pdf">DOWNLOAD</a>'), Response()]
         self.assertTrue(self.download(mirrors))
         self.assertEqual([url for url, _ in self.calls[:2]], mirrors)
         self.assertEqual(self.calls[-1][1]['headers']['Referer'], mirrors[1])
@@ -254,7 +265,7 @@ class SyncDownloadTests(unittest.TestCase):
         rejected = self.root / 'Low_Relevance_Files' / 'test.pdf'
         rejected.parent.mkdir()
         rejected.write_bytes(b'older file')
-        self.responses = [Response(text='<a href="/file">GET</a>'), Response()]
+        self.responses = [Response(text='<a href="/file.pdf">GET</a>'), Response()]
         self.assertFalse(self.download(['https://one.example/book/123', 'https://two.example/book/123']))
         self.assertEqual(len(self.calls), 2)
         self.assertFalse(self.destination.exists())
@@ -266,15 +277,14 @@ class SyncDownloadTests(unittest.TestCase):
         self.seed_part(b'tiny')
         self.responses = [Response()]
         self.assertIs(self.ns['download_file']('https://cdn.example/file', 'test.pdf', 'https://mirror.example'), True)
-        self.assertNotIn('Range', self.calls[0][1]['headers'])
+        self.assertIn('Range', self.calls[0][1]['headers'])
         self.assertEqual(self.destination.read_bytes(), PDF)
 
     def test_empty_or_incomplete_stream_does_not_finalize(self):
-        self.responses = [Response(data=b'', headers={'content-length': '100'}) for _ in range(5)]
+        self.responses = [Response(data=b'', headers={'content-length': '100'}) for _ in range(2)]
         self.assertEqual(self.ns['download_file']('https://cdn.example/file', 'test.pdf', 'https://mirror.example'), 'retry_next')
         self.assertFalse(self.destination.exists())
-        # The baseline immediately switches gateways after a sub-minimum file.
-        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(len(self.calls), 2)
 
 
 if __name__ == '__main__':

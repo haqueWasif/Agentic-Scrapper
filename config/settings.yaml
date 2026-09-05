@@ -1,0 +1,8 @@
+network:
+  proxy_enabled: false
+  max_workers: 3
+  retry_limit: 5
+  retry_window_seconds: 1800
+  cooldown_enabled: true
+  new_download_min_seconds: 2
+  new_download_max_seconds: 6

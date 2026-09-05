@@ -1,13 +1,15 @@
 """Streamlit entry point for the complete ASHRAE scraping pipeline."""
 
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from contextlib import nullcontext
 import hashlib
 import json
 import logging
 import os
 import random
 import re
+from queue import Empty
 import shutil
 import threading
 import time
@@ -24,7 +26,16 @@ from curl_cffi import requests as c_requests
 from dotenv import load_dotenv
 from pypdf import PdfReader
 
-from app.agents.orchestrator import invoke_scraper_graph
+from app.agents.orchestrator import invoke_pdf_validation_graph, invoke_scraper_graph
+from app.network_manager import NetworkManager
+from app.pdf_validation import (
+    completed_validation_report,
+    extract_pdf_preview,
+    scan_existing_pdfs,
+    store_validated_pdf,
+    validation_summary,
+    write_validation_report,
+)
 from app.semantic_extractor import extract_markdown
 
 
@@ -35,6 +46,7 @@ DOWNLOAD_DIRECTORY = PROJECT_ROOT / "data" / "ASHRAE_Files"
 LOW_RELEVANCE_DIRECTORY = PROJECT_ROOT / "data" / "Low_Relevance_Files"
 SEARCH_CACHE_DIRECTORY = PROJECT_ROOT / "data" / "search_cache"
 DOWNLOAD_STATE_FILE = PROJECT_ROOT / "data" / "downloads.json"
+DATA_DIRECTORY = PROJECT_ROOT / "data"
 SEARCH_TIMEOUT_SECONDS = 45
 SEARCH_RETRIES = 2
 DEFAULT_MODE = "research"
@@ -312,7 +324,7 @@ def log_status(message: str, on_status=None) -> None:
         on_status(message)
 
 
-def download_file(direct_link, filename, referer_url, *, on_status=None, on_progress=None):
+def download_file(direct_link, filename, referer_url, *, on_status=None, on_progress=None, network=None, worker_id=0, proxy=None):
     """Port of the proven baseline transfer loop; returns True or ``retry_next``."""
     (on_status or logging.getLogger(__name__).info)(f"TRACE download_file ENTER: URL={direct_link}; filename={filename}")
     status_logger = globals().get("log_status")
@@ -337,10 +349,51 @@ def download_file(direct_link, filename, referer_url, *, on_status=None, on_prog
         "Accept-Language": "en-US,en;q=0.9",
     }
     current_gateway = direct_link
-    max_attempts = 3
+    retry_window_seconds = network.settings.retry_window_seconds if network else max(5, int(os.getenv("DOWNLOAD_RETRY_WINDOW_SECONDS", "1800")))
+    retry_deadline = time.monotonic() + retry_window_seconds
+    temporary_attempt = 0
     attempt = 0
+    transfer_started_at = time.monotonic()
+    retry_origin_size = None
 
-    while attempt < max_attempts:
+    def retry_same_gateway(session, reason: str, current_size: int, *, refresh_cookies: bool = False) -> bool:
+        """Allow one cooldown retry; a second transient failure advances the queue."""
+        nonlocal temporary_attempt, retry_origin_size
+        if temporary_attempt >= 1:
+            stall = retry_origin_size == current_size
+            report(
+                f"Gateway unhealthy:\nURL: {current_gateway}\nExisting bytes: {current_size}\n"
+                f"Reason: {'download stalled after retry; no new bytes received' if stall else reason}\n"
+                "Action: second temporary failure; switch to the next health-ranked candidate."
+            )
+            record_state("partial" if part_file_path.exists() else "failed", f"gateway unhealthy: {reason}")
+            return False
+
+        if refresh_cookies:
+            cookies = getattr(session, "cookies", None)
+            clear_cookies = getattr(cookies, "clear", None)
+            if callable(clear_cookies):
+                clear_cookies()
+                cookie_action = "refresh session cookies + retry same gateway"
+            else:
+                cookie_action = "retry same gateway (session exposes no cookie jar)"
+        else:
+            cookie_action = "retry same gateway"
+
+        temporary_attempt = 1
+        retry_origin_size = current_size
+        retry_delay = random.randint(8, 15)
+        record_state("partial" if part_file_path.exists() else "failed", reason)
+        report(
+            f"Download recovery:\nURL: {current_gateway}\nExisting bytes: {current_size}\n"
+            f"Reason: {reason}\nAction: {cookie_action}\n"
+            + (f"Range: bytes={current_size}-" if current_size else "Range: (none; no partial file yet)")
+            + f"\nNext retry: {retry_delay} seconds (same gateway recovery 1/1; HTTP/1.1 streaming enabled)."
+        )
+        time.sleep(retry_delay)
+        return True
+
+    while time.monotonic() < retry_deadline:
         existing_size = part_file_path.stat().st_size if part_file_path.exists() else 0
         report(f"TRACE .part detected={part_file_path.exists()}; path={part_file_path}; existing_size={existing_size}")
         bytes_downloaded = existing_size
@@ -351,7 +404,7 @@ def download_file(direct_link, filename, referer_url, *, on_status=None, on_prog
                 report(
                     f"Filename: {filename}\nGateway attempted: {direct_link}\n"
                     f"♻️ Found .part file after connection loss. Resuming via HTTP Range headers from byte {existing_size} "
-                    f"(attempt {attempt + 1}/{max_attempts})."
+                    f"(request attempt {attempt + 1})."
                 )
             else:
                 report(f"♻️ Found .part file. Resuming download via HTTP Range headers from byte {existing_size}...")
@@ -359,16 +412,17 @@ def download_file(direct_link, filename, referer_url, *, on_status=None, on_prog
             if "Range" in download_headers:
                 del download_headers["Range"]
         try:
-            report(f"Transfer state: current_gateway={current_gateway}; bytes_downloaded={bytes_downloaded}; attempt_number={attempt + 1}/{max_attempts}")
-            with c_requests.Session() as s:
+            report(f"Transfer state: current_gateway={current_gateway}; bytes_downloaded={bytes_downloaded}; request_attempt={attempt + 1}")
+            with (nullcontext(network.session()) if network else c_requests.Session()) as s:
                 report(f"TRACE curl_cffi request: URL={direct_link}; Range={download_headers.get('Range', '(none)')}")
                 report(
                     f"🛡️ curl_cffi (chrome120): Initiating TLS connection to {direct_link} "
-                    f"(attempt {attempt + 1}/{max_attempts}, timeout=180s, Referer={referer_url})..."
+                    f"(request attempt {attempt + 1}, connect timeout=15s, read timeout=60s, Referer={referer_url}, HTTP/1.1)..."
                 )
                 r = s.get(
                     direct_link, headers=download_headers, stream=True,
-                    timeout=180, impersonate="chrome120",
+                    timeout=(15, 60), impersonate="chrome120", http_version="v1",
+                    **(network.request_options(proxy) if network else {}),
                 )
                 report(
                     f"📡 Gateway response: HTTP {r.status_code}; "
@@ -376,18 +430,14 @@ def download_file(direct_link, filename, referer_url, *, on_status=None, on_prog
                     f"Content-Length={r.headers.get('content-length', 'unknown')} bytes."
                 )
                 if r.status_code >= 500:
-                    attempt += 1
-                    report(
-                        f"HTTP {r.status_code} temporary failure\n"
-                        f"Action: retry same gateway\n"
-                        f"Existing bytes: {existing_size}\n"
-                        + (f"Range: bytes={existing_size}-" if existing_size else "Range: (none; no partial file yet)")
-                    )
-                    record_state("partial" if part_file_path.exists() else "failed", f"HTTP {r.status_code} temporary failure")
-                    if attempt < max_attempts:
+                    if network:
+                        network.result(proxy, False)
+                        network.gateway_result(direct_link, r.status_code)
+                    reason = f"HTTP {r.status_code} after Range request" if existing_size else f"HTTP {r.status_code} before transfer"
+                    if retry_same_gateway(s, reason, existing_size, refresh_cookies=r.status_code == 500):
+                        attempt += 1
                         continue
-                    report("Temporary-failure retry limit reached; preserving .part and moving to next valid gateway.")
-                    break
+                    return "retry_next"
                 if r.status_code == 416:
                     report(f"Filename: {filename}\nGateway attempted: {direct_link}\nFailure reason: range not satisfied; restarting from scratch.")
                     if part_file_path.exists():
@@ -397,10 +447,25 @@ def download_file(direct_link, filename, referer_url, *, on_status=None, on_prog
                 if r.status_code not in [200, 206]:
                     report(f"Gateway permanently failed:\nURL: {direct_link}\nReason: HTTP {r.status_code}\nAction: switch gateway without retrying this response.")
                     record_state("partial" if part_file_path.exists() else "failed", f"HTTP {r.status_code}")
+                    if network:
+                        network.result(proxy, False)
+                        network.gateway_result(direct_link, r.status_code)
                     return "retry_next"
                 if "text/html" in r.headers.get("Content-Type", "").lower():
+                    if transfer_started or existing_size > 0:
+                        if network:
+                            network.result(proxy, False)
+                            network.gateway_result(direct_link)
+                        reason = f"HTML response (HTTP {r.status_code}) during PDF transfer"
+                        if retry_same_gateway(s, reason, existing_size, refresh_cookies=r.status_code == 500):
+                            attempt += 1
+                            continue
+                        return "retry_next"
                     report(f"Gateway permanently failed:\nURL: {direct_link}\nReason: HTML challenge page (HTTP {r.status_code})\nAction: switch gateway.")
                     record_state("partial" if part_file_path.exists() else "failed", "HTML challenge page")
+                    if network:
+                        network.result(proxy, False)
+                        network.gateway_result(direct_link, r.status_code)
                     return "retry_next"
 
                 content_type = r.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
@@ -410,6 +475,9 @@ def download_file(direct_link, filename, referer_url, *, on_status=None, on_prog
                 }:
                     report(f"Gateway permanently failed:\nURL: {direct_link}\nReason: invalid content type {content_type}\nAction: switch gateway.")
                     record_state("partial" if part_file_path.exists() else "failed", f"invalid content type: {content_type}")
+                    if network:
+                        network.result(proxy, False)
+                        network.gateway_result(direct_link)
                     return "retry_next"
 
                 transfer_started = True
@@ -427,7 +495,7 @@ def download_file(direct_link, filename, referer_url, *, on_status=None, on_prog
                     on_progress(initial_progress, total_size)
                 with part_file_path.open(mode) as pdf_file:
                     report(f"TRACE streaming ENTER: mode={mode}; expected_total={total_size}; offset={pdf_file.tell()}")
-                    for chunk in r.iter_content(chunk_size=65536):
+                    for chunk in r.iter_content(chunk_size=256 * 1024):
                         if chunk:
                             if pdf_file.tell() == initial_progress:
                                 report(f"TRACE streaming first chunk: {len(chunk)} bytes")
@@ -448,25 +516,42 @@ def download_file(direct_link, filename, referer_url, *, on_status=None, on_prog
                 return "retry_next"
             os.replace(part_file_path, file_path)
             record_state("completed")
-            report(f"Filename: {filename}\nDownloaded successfully")
+            if network:
+                network.result(proxy, True)
+                network.gateway_result(direct_link, r.status_code, completed=True)
+            elapsed_seconds = max(time.monotonic() - transfer_started_at, 0.001)
+            completed_bytes = file_path.stat().st_size
+            average_speed = completed_bytes / elapsed_seconds / (1024 * 1024)
+            report(
+                f"PDF: {filename}\nTime: {elapsed_seconds:.1f} seconds\n"
+                f"Average speed: {average_speed:.1f} MB/s\nRetries: {temporary_attempt}\n"
+                f"Gateway: {urlparse(current_gateway).hostname or current_gateway}"
+            )
             return True
         except Exception as exc:
             new_size = part_file_path.stat().st_size if part_file_path.exists() else 0
             record_state("partial" if new_size else "failed", f"{type(exc).__name__}: {exc}")
-            if not transfer_started and not new_size:
+            if network:
+                network.result(proxy, False)
+                network.gateway_result(direct_link)
+            temporary_failure = (
+                transfer_started or new_size > 0
+                or isinstance(exc, (ConnectionError, TimeoutError))
+                or type(exc).__name__ in {"DNSError", "IncompleteRead", "SocketError", "ReadTimeout"}
+                or "http/2 stream" in str(exc).lower()
+                or "connection reset" in str(exc).lower()
+            )
+            if not temporary_failure:
                 report(f"Filename: {filename}\nGateway attempted: {direct_link}\nFailure reason: {type(exc).__name__}: {exc}; no partial transfer to resume, trying next gateway.")
                 return "retry_next"
-            attempt += 1
             bytes_downloaded = new_size
-            report(
-                f"Download interrupted:\nURL: {current_gateway}\nExisting bytes: {bytes_downloaded}\n"
-                f"Reason: {type(exc).__name__}: {exc}\nFailed transfer attempt: {attempt}/{max_attempts}\n"
-                + (f"Action: retry same gateway\nRange: bytes={new_size}-" if attempt < max_attempts
-                   else "Action: retry limit reached; preserve .part for recovery. This is not a permanent gateway rejection.")
-            )
-            if attempt < max_attempts:
-                time.sleep(5)
-    record_state("partial" if part_file_path.exists() else "failed", "retry attempts exhausted")
+            reason = f"{type(exc).__name__}: {exc}"
+            if retry_same_gateway(None, reason, bytes_downloaded):
+                attempt += 1
+                continue
+            return "retry_next"
+    record_state("partial" if part_file_path.exists() else "failed", "temporary retry window elapsed")
+    report(f"Filename: {filename}\nGateway attempted: {direct_link}\nTemporary retry window ({retry_window_seconds}s) elapsed; preserving .part and moving to next valid gateway.")
     return "retry_next"
 
 
@@ -488,7 +573,7 @@ def _check_download_relevance(filename, on_status=None) -> bool:
     return False
 
 
-def parse_mirror_and_download(mirror_link, filename, needs_page_check=True, *, on_status=None, on_progress=None, _visited=None):
+def parse_mirror_and_download(mirror_link, filename, needs_page_check=True, *, on_status=None, on_progress=None, _visited=None, network=None, worker_id=0, proxy=None):
     """Port of the baseline mirror parser and alternative-gateway loop."""
     status_logger = globals().get("log_status")
     report = (
@@ -504,6 +589,37 @@ def parse_mirror_and_download(mirror_link, filename, needs_page_check=True, *, o
         mirror_parts = urlparse(mirror_link)
         mirror_host = (mirror_parts.hostname or "").lower()
 
+        def is_ipfs_gateway(link):
+            parts = urlparse(link)
+            host = (parts.hostname or "").lower().rstrip(".")
+            return any(token in host for token in (
+                "ipfs.io", "cloudflare-ipfs", "gateway.ipfs", "pinata.cloud", "dweb.link",
+            )) or "/ipfs/" in parts.path.lower()
+
+        def candidate_priority(link):
+            parts = urlparse(link)
+            path = parts.path.lower()
+            host = (parts.hostname or "").lower()
+            if path.endswith(".pdf"):
+                return 0
+            if host == "library.lol" and path.startswith("/main/"):
+                return 1
+            if "get.php" in path:
+                return 2
+            if is_ipfs_gateway(link):
+                return 3
+            return 4
+
+        def order_candidates(links):
+            return sorted(
+                links,
+                key=lambda link: (
+                    candidate_priority(link),
+                    -(network.gateway_score(link) if network else 0),
+                    link,
+                ),
+            )
+
         def blocked(link):
             parts = urlparse(link)
             host = (parts.hostname or "").lower().rstrip(".")
@@ -512,31 +628,30 @@ def parse_mirror_and_download(mirror_link, filename, needs_page_check=True, *, o
                 or host in ("localhost", "::1", "0.0.0.0")
                 or host.startswith("127.") or host.endswith(".localhost")
                 or host == "onion" or host.endswith(".onion")
-                or any(token in host for token in ("ipfs.io", "cloudflare-ipfs", "gateway.ipfs", "pinata.cloud", "dweb.link"))
-                or "/ipfs/" in parts.path.lower()
             )
 
         if blocked(mirror_link):
-            report(f"Excluded gateway: {mirror_link}")
             return "retry_next"
         # A result row can already contain a direct Libgen GET/CDN route.  Do
         # not fetch it as HTML first: send it to the proven resumable transfer.
         if (
             "get.php" in mirror_parts.path.lower()
             or mirror_parts.path.lower().endswith(".pdf")
+            or is_ipfs_gateway(mirror_link)
         ):
-            report(f"Candidate gateway ranking:\n1. {mirror_link}\nFinal download candidates:\n1. {mirror_link}")
-            report(f"TRACE calling download_file: {mirror_link}")
+            report(f"Final download candidates:\n1. {mirror_link}")
             return download_file(
                 mirror_link, filename, mirror_link,
                 on_status=on_status, on_progress=on_progress,
+                network=network, worker_id=worker_id, proxy=proxy,
             )
-        with c_requests.Session() as s:
+        with (nullcontext(network.session()) if network else c_requests.Session()) as s:
             report(f"🔍 curl_cffi (chrome120): Fetching mirror page HTML from {mirror_link} (timeout=15s)...")
             res = s.get(
                 mirror_link,
                 timeout=15,
                 impersonate="chrome120",
+                **(network.request_options(proxy) if network else {}),
             )
             report(f"📡 Mirror response: HTTP {res.status_code} from {mirror_link}.")
             if res.status_code != 200:
@@ -554,19 +669,15 @@ def parse_mirror_and_download(mirror_link, filename, needs_page_check=True, *, o
             parsed = urlparse(link)
             host = (parsed.hostname or "").lower().rstrip(".")
             if parsed.scheme not in ("http", "https") or not host:
-                report(f"TRACE filter rejected invalid URL: {link}")
                 return
             if blocked(link):
-                report(f"TRACE filter rejected blocked host/path: {link}")
                 return
             path = parsed.path.lower()
             if any(route in path for route in ("edition.php", "file.php", "ads.php")):
-                report(f"TRACE filter discovery-only navigation URL: {link}")
                 if (host.startswith("libgen.") or ".libgen." in host) and link not in visited and link not in discovery_links:
                     discovery_links.append(link)
                 return
-            if not ("get.php" in path or (host == "library.lol" and path.startswith("/main/")) or path.endswith(".pdf")):
-                report(f"TRACE filter rejected: path is not get.php, library.lol/main/, or a .pdf suffix: {link}")
+            if not ("get.php" in path or (host == "library.lol" and path.startswith("/main/")) or path.endswith(".pdf") or is_ipfs_gateway(link)):
                 return
             if link not in download_links and link not in visited:
                 download_links.append(link)
@@ -626,15 +737,6 @@ def parse_mirror_and_download(mirror_link, filename, needs_page_check=True, *, o
                     and full_link not in download_links
                 ):
                     add_candidate(full_link)
-            report(
-                f"Mirror:\n{mirror_link}\nFound candidate links:\n[\n"
-                + "\n".join(f"  {link}" for link in download_links)
-                + "\n]"
-            )
-        report(f"TRACE extracted gateway candidates: {len(extracted_candidates)}")
-        report("TRACE candidates BEFORE filtering:\n" + "\n".join(extracted_candidates))
-        report("TRACE candidates AFTER filtering:\n" + ("\n".join(download_links) or "(empty)"))
-        report("TRACE internal discovery pages:\n" + ("\n".join(discovery_links) or "(empty)"))
         if not download_links and not discovery_links:
             report(
                 f"Filename: {filename}\nGateway attempted: {mirror_link}\n"
@@ -642,42 +744,42 @@ def parse_mirror_and_download(mirror_link, filename, needs_page_check=True, *, o
             )
             return "retry_next"
 
-        # Excluded public gateways are never appended when a non-IPFS route exists.
-        download_links.sort(key=lambda link: (
-            0 if "get.php" in urlparse(link).path.lower() else
-            1 if "library.lol/main/" in link.lower() else 2,
-            0 if urlparse(link).hostname == "libgen.bz" else 1,
-        ))
+        # Navigation pages can expose a preferred direct route. Resolve them before
+        # falling through to an IPFS-only candidate set.
+        if discovery_links and not any(candidate_priority(link) < 3 for link in download_links):
+            for discovery_link in discovery_links:
+                if parse_mirror_and_download(discovery_link, filename, False, on_status=on_status, on_progress=on_progress, _visited=visited, network=network, worker_id=worker_id, proxy=proxy) is True:
+                    return True
 
-        report("Candidate gateway ranking:\n" + "\n".join(
-            f"{index}. {link}" for index, link in enumerate(download_links, start=1)
-        ))
+        download_links = order_candidates(download_links)
         report("Final download candidates:\n" + ("\n".join(
             f"{index}. {link}" for index, link in enumerate(download_links, start=1)
         ) or "None; checking internal discovery pages."))
         success = False
-        for direct_link in download_links:
+        pending_candidates = list(download_links)
+        while pending_candidates:
+            direct_link = pending_candidates.pop(0)
             if blocked(direct_link):
-                report(f"TRACE final filter rejected blocked candidate: {direct_link}")
                 continue
             if urlparse(direct_link).hostname == "library.lol" and urlparse(direct_link).path.startswith("/main/"):
-                result = parse_mirror_and_download(direct_link, filename, False, on_status=on_status, on_progress=on_progress, _visited=visited)
+                result = parse_mirror_and_download(direct_link, filename, False, on_status=on_status, on_progress=on_progress, _visited=visited, network=network, worker_id=worker_id, proxy=proxy)
             else:
-                report(f"TRACE calling download_file: {direct_link}")
                 result = download_file(
                     direct_link, filename, mirror_link, on_status=on_status, on_progress=on_progress,
+                    network=network, worker_id=worker_id, proxy=proxy,
                 )
             if result is True:
                 success = True
                 break
             if result == "retry_next":
                 report(f"Filename: {filename}\nGateway attempted: {direct_link}\nFailure reason: switching to alternative gateway.")
+                pending_candidates = order_candidates(pending_candidates)
                 continue
             break
         if not success:
             for discovery_link in discovery_links:
                 report(f"🔍 Internal discovery page (not a download): {discovery_link}")
-                if parse_mirror_and_download(discovery_link, filename, False, on_status=on_status, on_progress=on_progress, _visited=visited) is True:
+                if parse_mirror_and_download(discovery_link, filename, False, on_status=on_status, on_progress=on_progress, _visited=visited, network=network, worker_id=worker_id, proxy=proxy) is True:
                     success = True
                     break
         if success and filename.lower().endswith(".pdf") and needs_page_check:
@@ -790,8 +892,117 @@ def _bulk_candidates_from_page(
     return candidates, skipped_completed
 
 
-def _schedule_validation(filename: str) -> None:
-    """Validate in the background so PDF extraction never holds up transfer workers."""
+def _validate_pdf_stage2(
+    file_path: Path, source: str, *, stage1_score: int | None = None, on_status=None,
+) -> dict[str, Any]:
+    """Run conservative Stage 2 validation and preserve inconclusive files as pending."""
+    report = on_status or logging.getLogger(__name__).info
+    existing_report = completed_validation_report(file_path, DATA_DIRECTORY)
+    if existing_report:
+        return existing_report
+
+    report(f"📄 PyPDF: Sampling representative pages and metadata for Stage 2 validation: {file_path.name}")
+    preview = extract_pdf_preview(file_path)
+    if preview["error"]:
+        validation = {
+            "status": "PENDING", "approved": False, "score": 0, "confidence": "low",
+            "needs_more_text": False, "categories": [], "reason": preview["error"],
+        }
+    else:
+        report(
+            f"📄 Preview quality: {preview['extraction_quality']} · pages {preview['pages_sampled']} · "
+            f"{preview['characters']} characters · {preview['pages_with_text']} page(s) with usable text."
+        )
+
+        def evaluate(current_preview: dict[str, Any]) -> dict[str, Any]:
+            report("🧠 LangGraph: Routing representative PDF evidence to the Stage 2 CrewAI validator...")
+            return asyncio.run(invoke_pdf_validation_graph({
+                "filename": file_path.name,
+                "pdf_text": current_preview["text"],
+                "pdf_metadata": current_preview["metadata"],
+                "extraction_error": current_preview["error"],
+                "extraction_quality": current_preview["extraction_quality"],
+                "pages_sampled": current_preview["pages_sampled"],
+                "page_count": current_preview["page_count"],
+                "source_metadata": {"source": source, "stage1_score": stage1_score},
+                "validation": {},
+            }, report))["validation"]
+
+        validation = evaluate(preview)
+        if validation.get("needs_more_text") and len(preview["pages_sampled"]) < min(preview["page_count"], 10):
+            report("📄 Stage 2 requested more evidence; sampling the next representative PDF pages once.")
+            extra = extract_pdf_preview(
+                file_path,
+                start_page=len(preview["pages_sampled"]),
+                max_pages=10 - len(preview["pages_sampled"]),
+                max_characters=max(0, 12000 - preview["characters"]),
+            )
+            if not extra["error"]:
+                preview = {
+                    **preview,
+                    "text": (preview["text"] + "\n\n" + extra["text"]).strip()[:12000],
+                    "pages_sampled": preview["pages_sampled"] + extra["pages_sampled"],
+                    "pages_with_text": preview["pages_with_text"] + extra["pages_with_text"],
+                    "characters": min(12000, preview["characters"] + extra["characters"]),
+                    "toc_pages": preview["toc_pages"] + extra["toc_pages"],
+                    "extraction_quality": "good" if preview["characters"] + extra["characters"] >= 2500 and preview["pages_with_text"] + extra["pages_with_text"] >= 2 else preview["extraction_quality"],
+                }
+                validation = evaluate(preview)
+
+    original_size = file_path.stat().st_size if file_path.exists() else 0
+    status = str(validation.get("status") or "PENDING").upper()
+    if status not in {"APPROVED", "REJECTED", "PENDING"}:
+        status = "PENDING"
+    if status == "APPROVED" and (not validation.get("approved") or int(validation.get("score", 0)) < 70):
+        status = "PENDING"
+    if status == "REJECTED" and (validation.get("approved") or preview.get("extraction_quality") != "good"):
+        status = "PENDING"
+    stored_path = (
+        store_validated_pdf(file_path, DATA_DIRECTORY, status == "APPROVED")
+        if status in {"APPROVED", "REJECTED"} else file_path
+    )
+    validation_report = {
+        "filename": file_path.name,
+        "filepath": str(file_path),
+        "stored_path": str(stored_path),
+        "source": source,
+        "stage1_score": stage1_score,
+        "status": status,
+        "stage2_score": validation.get("score", 0),
+        "approved": status == "APPROVED",
+        "confidence": validation.get("confidence", "unknown"),
+        "needs_more_text": bool(validation.get("needs_more_text")),
+        "categories": validation.get("categories", []),
+        "reason": validation.get("reason", "Stage 2 returned no reason"),
+        "stage2_raw_response": str(validation.get("raw_response") or "")[:4000],
+        "stage2_normalized_result": {
+            key: validation.get(key) for key in (
+                "status", "approved", "score", "confidence", "needs_more_text", "categories", "reason",
+            )
+        },
+        "pages_sampled": preview["pages_sampled"],
+        "pages_with_text": preview["pages_with_text"],
+        "preview_character_count": preview["characters"],
+        "extraction_quality": preview["extraction_quality"],
+        "page_count": preview["page_count"],
+        "toc_pages": preview["toc_pages"],
+        "pdf_metadata": preview["metadata"],
+        "stage2_completed": status in {"APPROVED", "REJECTED"},
+    }
+    write_validation_report(file_path, DATA_DIRECTORY, validation_report)
+    report(
+        f"Stage 2 {status.lower()}: {file_path.name} (score {validation_report['stage2_score']}) → {stored_path.name}"
+    )
+    if source == "new_download":
+        _update_download_state(
+            file_path.name, "", "completed" if status == "APPROVED" else "failed" if status == "REJECTED" else "pending_validation",
+            size=original_size, reason=validation_report["reason"],
+        )
+    return validation_report
+
+
+def _schedule_validation(filename: str, *, stage1_score: int | None = 100) -> None:
+    """Queue Stage 2 after a new download so transfer workers remain non-blocking."""
     _, destination, _ = _download_paths(filename)
     if not destination.exists():
         return
@@ -800,10 +1011,7 @@ def _schedule_validation(filename: str) -> None:
 
     def validate() -> None:
         try:
-            relevant = _check_download_relevance(filename)
-            status = "completed" if relevant else "failed"
-            reason = None if relevant else "first-page relevance rejected"
-            _update_download_state(filename, "", status, size=_download_size(filename), reason=reason)
+            _validate_pdf_stage2(destination, "new_download", stage1_score=stage1_score)
         except Exception as exc:
             _update_download_state(filename, "", "pending_validation", size=_download_size(filename), reason=f"validation error: {type(exc).__name__}")
             logging.getLogger(__name__).warning("Validation pending for %s: %s", filename, type(exc).__name__)
@@ -818,6 +1026,28 @@ def _schedule_validation(filename: str) -> None:
     timer = threading.Timer(VALIDATION_TIMEOUT_SECONDS, mark_pending_if_slow)
     timer.daemon = True
     timer.start()
+
+
+def scan_and_validate_existing_pdfs(on_status, *, revalidate: bool = False) -> dict[str, int]:
+    """Process unmanaged PDFs in data/ directly through Stage 2, never Stage 1."""
+    candidates = scan_existing_pdfs(DATA_DIRECTORY, revalidate=revalidate)
+    on_status(f"📂 Existing PDF Scan: Found {len(candidates)} PDF(s) requiring Stage 2 validation.")
+    approved = rejected = pending = 0
+    for candidate in candidates:
+        try:
+            validation = _validate_pdf_stage2(
+                Path(candidate["filepath"]), "existing_pdf", on_status=on_status,
+            )
+            if validation["status"] == "APPROVED":
+                approved += 1
+            elif validation["status"] == "REJECTED":
+                rejected += 1
+            else:
+                pending += 1
+        except Exception as exc:
+            pending += 1
+            on_status(f"⚠️ Stage 2 could not validate {candidate['filename']}: {type(exc).__name__}")
+    return {"found": len(candidates), "processed": approved + rejected + pending, "approved": approved, "rejected": rejected, "pending": pending}
 
 
 async def _download_bulk_cards(candidates: list[dict[str, Any]], debug) -> int:
@@ -845,6 +1075,88 @@ async def _download_bulk_cards(candidates: list[dict[str, Any]], debug) -> int:
         # Yield to Streamlit's event loop between files without delaying the queue.
         await asyncio.sleep(0)
     return completed
+
+
+def _download_worker(candidate: dict[str, Any], network: NetworkManager, worker_id: int) -> bool:
+    """Worker-only transfer path; Streamlit rendering remains on the main thread."""
+    filename = candidate["filename"]
+    proxy = network.begin_download(worker_id, filename)
+
+    def status(message: str) -> None:
+        network.emit("status", worker_id, filename, message)
+
+    def progress(downloaded: int, total: int | None) -> None:
+        network.emit("progress", worker_id, filename, downloaded=downloaded, total=total or 0)
+
+    for mirror_attempt, mirror in enumerate(candidate["mirrors"], start=1):
+        result = parse_mirror_and_download(
+            mirror, filename, needs_page_check=False, on_status=status,
+            on_progress=progress, network=network, worker_id=worker_id, proxy=proxy,
+        )
+        if result is True:
+            _schedule_validation(filename, stage1_score=candidate.get("stage1_score", 100))
+            network.emit("success", worker_id, filename, "Downloaded successfully; Stage 2 PDF validation queued.")
+            return True
+        if result == "retry_next":
+            network.cooldown(mirror_attempt)
+    network.emit("failure", worker_id, filename, "All valid gateways failed.")
+    return False
+
+
+async def _download_concurrent_cards(candidates: list[dict[str, Any]], network: NetworkManager, debug) -> tuple[int, list[str]]:
+    """Run at most three downloads concurrently and consume telemetry on the UI thread."""
+    if not candidates:
+        return 0, []
+    cards = {}
+    for candidate in candidates:
+        filename = candidate["filename"]
+        with st.status(f"⬇️ Processing: {filename[:40]}...", expanded=False) as card:
+            card.write("⏳ Queued for a controlled curl_cffi worker...")
+            cards[filename] = (card, st.empty())
+    completed, failed = 0, []
+    with ThreadPoolExecutor(max_workers=network.settings.max_workers, thread_name_prefix="pdf-download") as executor:
+        pending = {
+            executor.submit(_download_worker, candidate, network, (index % network.settings.max_workers) + 1): candidate
+            for index, candidate in enumerate(candidates)
+        }
+        while pending:
+            while True:
+                try:
+                    event = network.events.get_nowait()
+                except Empty:
+                    break
+                card, progress = cards[event["filename"]]
+                if event["kind"] == "progress":
+                    total = event["total"]
+                    transferred = event["downloaded"]
+                    fraction = min(transferred / total, 1.0) if total else 0.0
+                    progress.progress(fraction, text=f"Worker {event['worker']}/{network.settings.max_workers}: {transferred / (1024 * 1024):.2f} MB" + (f" / {total / (1024 * 1024):.2f} MB" if total else ""))
+                elif event["kind"] == "status":
+                    card.write(event["message"])
+                elif event["kind"] == "success":
+                    card.write(event["message"])
+                elif event["kind"] == "failure":
+                    card.write(event["message"])
+            done, _ = wait(pending, timeout=0.2, return_when=FIRST_COMPLETED)
+            for future in done:
+                candidate = pending.pop(future)
+                filename = candidate["filename"]
+                card, progress = cards[filename]
+                progress.empty()
+                try:
+                    if future.result():
+                        completed += 1
+                        card.update(label=f"✅ Secured: {filename[:40]}", state="complete", expanded=False)
+                        debug(f"Filename: {filename}\nDownloaded successfully")
+                    else:
+                        failed.extend(candidate["mirrors"])
+                        card.update(label=f"❌ Failed: {filename[:40]}", state="error", expanded=False)
+                except Exception:
+                    failed.extend(candidate["mirrors"])
+                    debug(f"Filename: {filename}\nFailure reason:\n{traceback.format_exc()}")
+                    card.update(label=f"❌ Failed: {filename[:40]}", state="error", expanded=False)
+            await asyncio.sleep(0)
+    return completed, failed
 
 
 def _search_cache_path(search_url: str) -> Path:
@@ -962,6 +1274,7 @@ async def run_scraping_pipeline(
         st.session_state["_download_debug"] = []
     failed_urls: list[str] = []
     debug_events: list[str] = []
+    network = NetworkManager(PROJECT_ROOT)
 
     def debug(message: str) -> None:
         debug_events.append(message)
@@ -1137,45 +1450,35 @@ async def run_scraping_pipeline(
                     label=f"✅ AI Approved {len(approved_docs)} documents.",
                     state="complete", expanded=False,
                 )
-                # Place each file card below, rather than inside, the approval card.
-                with downloads_area:
-                    for item_number, document in enumerate(approved_docs, start=1):
-                        if documents_downloaded >= target_documents:
-                            break
-                        title = str(document.get("title") or "Untitled document")
-                        mirror_links = _document_mirror_links(document, search_rows, search_url)
-                        filename = _safe_pdf_filename(title, page_number, document["id"])
-                        _, destination, _ = _download_paths(filename)
-                        if destination.exists():
-                            main_status.write(f"📂 Already stored: {filename}; skipping download.")
-                            continue
-                        if not mirror_links:
-                            failed_urls.append(str(document.get("link") or "missing document link"))
-                            with st.status(
-                                f"⬇️ Processing: {filename[:40]}...", expanded=False
-                            ) as missing_status:
-                                st.write("No source link was available for this document.")
-                                missing_status.update(
-                                    label=f"❌ Failed: {filename[:40]}",
-                                    state="error", expanded=False,
-                                )
-                            continue
+                download_jobs = []
+                remaining = max(target_documents - documents_downloaded, 0)
+                for document in approved_docs[:remaining]:
+                    title = str(document.get("title") or "Untitled document")
+                    mirror_links = _document_mirror_links(document, search_rows, search_url)
+                    filename = _safe_pdf_filename(title, page_number, document["id"])
+                    _, destination, _ = _download_paths(filename)
+                    if destination.exists():
+                        main_status.write(f"📂 Already stored: {filename}; skipping download.")
+                    elif not mirror_links:
+                        failed_urls.append(str(document.get("link") or "missing document link"))
+                        with st.status(f"⬇️ Processing: {filename[:40]}...", expanded=False) as missing_status:
+                            st.write("No source link was available for this document.")
+                            missing_status.update(label=f"❌ Failed: {filename[:40]}", state="error", expanded=False)
+                    else:
                         try:
-                            if download_pdf(mirror_links, filename, defer_validation=True):
-                                documents_downloaded += 1
-                            else:
-                                failed_urls.extend(mirror_links)
-                        except Exception:
-                            failed_urls.extend(mirror_links)
-                            # Preserve a visible file outcome even for unexpected UI failures.
-                            with st.status(
-                                f"⬇️ Processing: {filename[:40]}...", expanded=False
-                            ) as failed_status:
-                                st.write("This document could not be retrieved.")
-                                failed_status.update(
-                                    label=f"❌ Failed: {filename[:40]}",
-                                    state="error", expanded=False,
-                                )
+                            stage1_score = int(document.get("score", 100) or 100)
+                        except (TypeError, ValueError):
+                            stage1_score = 100
+                        download_jobs.append({
+                            "filename": filename,
+                            "mirrors": mirror_links,
+                            "source_url": str(document.get("link") or ""),
+                            "stage1_score": stage1_score,
+                        })
+                with downloads_area:
+                    completed_now, failed_now = await _download_concurrent_cards(download_jobs, network, debug)
+                    documents_downloaded += completed_now
+                    failed_urls.extend(failed_now)
 
             if pages_processed or documents_downloaded >= target_documents:
                 final_label = (
@@ -1211,10 +1514,13 @@ async def run_scraping_pipeline(
             st.write("Document download outcomes:")
             st.code("\n\n".join(download_events))
 
+    network.close()
+    stage2_totals = validation_summary(DATA_DIRECTORY)
     return {
         "pages_processed": pages_processed,
         "documents_approved": documents_approved,
         "documents_downloaded": documents_downloaded,
+        "stage2_approved": stage2_totals["new_download_approved"],
     }
 
 
@@ -1301,11 +1607,41 @@ with action_col:
         type="primary",
         use_container_width=True,
     )
+    scan_existing = st.button("Scan Existing PDFs", use_container_width=True)
+    force_revalidation = st.checkbox("Re-validate completed PDFs", value=False)
 
 st.divider()
 st.subheader("Agent activity")
 
-if start_scraping:
+stage2_counts = validation_summary(DATA_DIRECTORY)
+pending_existing = len(scan_existing_pdfs(DATA_DIRECTORY, revalidate=force_revalidation))
+st.caption(
+    f"Existing PDF Scan: Found {pending_existing} pending PDF(s) · "
+    f"Stage 2 Validation: Approved {stage2_counts['approved']} · Rejected {stage2_counts['rejected']} · "
+    f"Pending/Error {stage2_counts['pending']}"
+)
+
+if scan_existing:
+    try:
+        with st.status("📂 Existing PDF Scan initialized...", expanded=True) as scan_status:
+            scan_result = scan_and_validate_existing_pdfs(
+                scan_status.write, revalidate=force_revalidation,
+            )
+            scan_status.update(
+                label=(
+                    f"✅ Stage 2 complete — {scan_result['approved']} approved, "
+                    f"{scan_result['rejected']} rejected, {scan_result['pending']} pending."
+                ),
+                state="complete", expanded=False,
+            )
+        st.success(
+            f"Existing PDF Scan: Found {scan_result['found']} · "
+            f"Processed {scan_result['processed']} / {scan_result['found']} · "
+            f"Approved {scan_result['approved']} · Rejected {scan_result['rejected']} · Pending/Error {scan_result['pending']}"
+        )
+    except Exception as exc:
+        st.error(f"Existing PDF validation could not finish: {exc}")
+elif start_scraping:
     try:
         result_summary = asyncio.run(
             run_scraping_pipeline(
@@ -1316,6 +1652,11 @@ if start_scraping:
             "Run finished: "
             f"{result_summary['pages_processed']} page(s) evaluated, "
             f"{result_summary['documents_downloaded']} PDF(s) downloaded."
+        )
+        st.caption(
+            f"New Pipeline: Stage 1 approved {result_summary['documents_approved']} · "
+            f"Downloaded {result_summary['documents_downloaded']} · "
+            f"Final accepted {result_summary['stage2_approved']}"
         )
     except Exception as exc:
         st.error(f"The pipeline stopped unexpectedly: {exc}")
