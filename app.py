@@ -30,6 +30,8 @@ from pypdf import PdfReader
 from app.agents.orchestrator import invoke_pdf_validation_graph, invoke_scraper_graph
 from app.network_manager import NetworkManager
 from app.observability import langsmith_status
+from app.pipeline_scheduler import DownloadOutcome, GlobalDownloadQueue
+from app.pipeline_state import lifecycle_view, stable_document_id
 from app.pdf_validation import (
     completed_validation_report,
     extract_pdf_preview,
@@ -440,6 +442,19 @@ def _update_download_state(
             else:
                 entry.pop("reason", None)
                 entry.pop("last_error", None)
+            source_candidate = candidate or entry.get("candidate") or {}
+            entry["source_metadata"] = {
+                **(entry.get("source_metadata") if isinstance(entry.get("source_metadata"), dict) else {}),
+                "source_url": entry.get("url", ""),
+                "mirrors": list(source_candidate.get("mirrors", [])),
+                "title": entry.get("title", filename),
+            }
+            lifecycle_builder = globals().get("lifecycle_view")
+            if callable(lifecycle_builder):
+                entry["lifecycle"] = lifecycle_builder(
+                    entry, status=status, candidate=source_candidate,
+                    validation_status=validation_status,
+                )
             state["downloads"][filename] = entry
             return _save_download_state(state)
 
@@ -1111,7 +1126,7 @@ def _validate_pdf_stage2(
         )
 
         def evaluate(current_preview: dict[str, Any]) -> dict[str, Any]:
-            report("🧠 LangGraph: Routing representative PDF evidence to the Stage 2 CrewAI validator...")
+            report(f"🧠 Stage 2: Sending PDF evidence for {file_path.name} to CrewAI/OpenRouter...")
             return asyncio.run(invoke_pdf_validation_graph({
                 "filename": file_path.name,
                 "pdf_text": current_preview["text"],
@@ -1521,6 +1536,106 @@ async def _download_round(
     return completed, failed_for_round
 
 
+class _StreamlitDownloadCoordinator:
+    """Main-thread Streamlit adapter around the bounded global download queue.
+
+    Worker threads only call ``_download_worker``.  This adapter owns all
+    Streamlit rendering and turns worker outcomes into recovery candidates.
+    """
+
+    def __init__(self, network: NetworkManager, debug) -> None:
+        self.network = network
+        self.debug = debug
+        self.cards: dict[str, tuple[Any, Any]] = {}
+        self.completed = 0
+        self.queue = GlobalDownloadQueue(
+            lambda candidate, worker_id: _download_worker(candidate, network, worker_id),
+            max_workers=network.settings.max_workers,
+            maxsize=network.settings.download_queue_maxsize,
+        )
+
+    def _card(self, candidate: dict[str, Any], *, recovery: bool) -> None:
+        filename = candidate["filename"]
+        existing = self.cards.get(filename)
+        if existing:
+            existing[0].write("♻️ Re-queued for the next global recovery round.")
+            return
+        with st.status(f"⬇️ Processing: {filename[:40]}...", expanded=False) as card:
+            card.write(
+                "♻️ Queued for global recovery." if recovery
+                else "⏳ Queued for a controlled global curl_cffi worker..."
+            )
+            self.cards[filename] = (card, st.empty())
+
+    async def enqueue(self, candidate: dict[str, Any], *, recovery: bool = False) -> None:
+        """Apply backpressure without blocking the search producer's event loop."""
+        while not self.queue.try_enqueue(candidate):
+            self.drain()
+            await asyncio.sleep(0.1)
+        self._card(candidate, recovery=recovery)
+        _update_download_state(
+            candidate["filename"], candidate.get("source_url", ""),
+            "RECOVERING" if recovery else "QUEUED",
+            size=_download_size(candidate["filename"]),
+            candidate={key: value for key, value in candidate.items() if not key.startswith("_")},
+            document_attempt=int(candidate.get("_document_attempt", 1) or 1), completed=False,
+        )
+
+    def drain(self) -> list[dict[str, Any]]:
+        """Render worker events and collect failures for a later recovery round."""
+        while True:
+            try:
+                event = self.network.events.get_nowait()
+            except Empty:
+                break
+            card_pair = self.cards.get(event["filename"])
+            if not card_pair:
+                continue
+            card, progress = card_pair
+            if event["kind"] == "progress":
+                total, transferred = event["total"], event["downloaded"]
+                fraction = min(transferred / total, 1.0) if total else 0.0
+                progress.progress(
+                    fraction,
+                    text=(f"Worker {event['worker']}/{self.network.settings.max_workers}: "
+                          f"{transferred / (1024 * 1024):.2f} MB" +
+                          (f" / {total / (1024 * 1024):.2f} MB" if total else "")),
+                )
+            else:
+                card.write(event["message"])
+
+        failed: list[dict[str, Any]] = []
+        for outcome in self.queue.drain_outcomes():
+            candidate, result = outcome.candidate, outcome.result
+            filename = candidate["filename"]
+            card, progress = self.cards[filename]
+            progress.empty()
+            if result.get("success"):
+                self.completed += 1
+                card.update(label=f"✅ Secured: {filename[:40]}", state="complete", expanded=False)
+                self.debug(f"Filename: {filename}\nDownloaded successfully")
+            elif result.get("permanent"):
+                card.update(label=f"❌ Failed: {filename[:40]}", state="error", expanded=False)
+            else:
+                if result.get("exception"):
+                    self.debug(f"Filename: {filename}\nFailure reason:\n{result['exception']!r}")
+                card.update(label=f"⚠️ Pending recovery: {filename[:40]}", state="running", expanded=False)
+                failed.append(result)
+        return failed
+
+    async def drain_until_idle(self) -> list[dict[str, Any]]:
+        failures: list[dict[str, Any]] = []
+        while not self.queue.idle:
+            failures.extend(self.drain())
+            await asyncio.sleep(0.1)
+        failures.extend(self.drain())
+        return failures
+
+    def close(self) -> None:
+        self.drain()
+        self.queue.close()
+
+
 def _search_cache_path(search_url: str) -> Path:
     """Return a stable cache file without putting query text in a filename."""
     digest = hashlib.sha256(search_url.encode("utf-8")).hexdigest()
@@ -1658,8 +1773,9 @@ async def run_scraping_pipeline(
 
     with pipeline_area:
         with st.status("🤖 Agentic Pipeline Initialized...", expanded=True) as main_status:
+            log = main_status.write
             if global_recovery_backlog:
-                main_status.write(
+                log(
                     f"♻️ Restored {len(global_recovery_backlog)} interrupted download(s); "
                     "they are queued for the global recovery round after new primary work."
                 )
@@ -1674,10 +1790,11 @@ async def run_scraping_pipeline(
                     label=f"🤖 Researching page {page_number} of {max_pages}...",
                     state="running", expanded=True,
                 )
+                log(f"——— Page {page_number} of {max_pages} ———")
                 if page_number > 1:
                     await asyncio.sleep(random.uniform(9.0, 15.0))
                 encoded_query = quote(query.strip(), safe="")
-                st.write(
+                log(
                     "🌐 ZenRows API: Bypassing anti-bot protection and fetching search results..."
                     if zenrows_api_key else
                     "🌐 curl_cffi: Fetching search results via the direct browser fallback (ZenRows API key not configured)..."
@@ -1698,43 +1815,43 @@ async def run_scraping_pipeline(
 
                 if not raw_html:
                     debug(f"Page {page_number}: trying direct browser fallback.")
-                    main_status.write("🔄 curl_cffi (chrome120): Trying direct browser search fallback...")
+                    log("🔄 curl_cffi (chrome120): Trying direct browser search fallback...")
                     raw_html = await _fetch_direct_search(search_url, debug)
                 if not raw_html:
                     # Keep the pre-existing local DoH route, but only after a normal browser
                     # request has had a chance to use the machine's configured DNS.
                     debug(f"Page {page_number}: trying local DoH fallback (Cloudflare).")
-                    main_status.write("🔄 curl_cffi: Retrying search with Cloudflare DNS-over-HTTPS...")
+                    log("🔄 curl_cffi: Retrying search with Cloudflare DNS-over-HTTPS...")
                     raw_html = await _fetch_direct_search(
                         search_url, debug, doh_url="https://cloudflare-dns.com/dns-query",
                     )
                 if not raw_html:
                     debug(f"Page {page_number}: trying local DoH fallback (Google).")
-                    main_status.write("🔄 curl_cffi: Retrying search with Google DNS-over-HTTPS...")
+                    log("🔄 curl_cffi: Retrying search with Google DNS-over-HTTPS...")
                     raw_html = await _fetch_direct_search(
                         search_url, debug, doh_url="https://dns.google/dns-query",
                     )
                 if not raw_html:
                     debug(f"Page {page_number}: trying cached/local search source.")
-                    main_status.write("📂 Search cache: Checking saved local HTML after live providers failed...")
+                    log("📂 Search cache: Checking saved local HTML after live providers failed...")
                     raw_html = _read_cached_search(search_url, debug)
                 if not raw_html:
                     failed_urls.append(search_url)
-                    main_status.write("All retrieval providers failed for this page; continuing.")
-                    st.write(f"Page {page_number} is unavailable. Continuing the search.")
+                    log("All retrieval providers failed for this page; continuing.")
+                    log(f"Page {page_number} is unavailable. Continuing the search.")
                     continue
                 _write_search_cache(search_url, raw_html, debug)
-                main_status.write("🕷️ BeautifulSoup: Parsing search-result table rows and extracting titles, metadata and document mirror URLs...")
+                log("🕷️ BeautifulSoup: Parsing search-result table rows and extracting titles, metadata and document mirror URLs...")
 
                 try:
                     search_rows = _extract_search_mirror_rows(raw_html, search_url)
                 except Exception:
                     search_rows = []
-                    main_status.write("Could not associate row mirrors; using the evaluator's source links.")
+                    log("Could not associate row mirrors; using the evaluator's source links.")
                     debug(f"Page {page_number}: mirror-row parsing failed:\n{traceback.format_exc()}")
                 try:
                     search_documents = _extract_search_documents(raw_html, search_url)
-                    main_status.write(f"📋 Extraction complete: {len(search_documents)} document record(s), {len(search_rows)} row-level mirror group(s).")
+                    log(f"📋 Extraction complete: {len(search_documents)} document record(s), {len(search_rows)} row-level mirror group(s).")
                     debug(f"Page {page_number}: extracted {len(search_documents)} search-result document(s).")
                     debug(
                         "First 5 extracted titles:\n"
@@ -1761,6 +1878,7 @@ async def run_scraping_pipeline(
 
                 if not search_documents:
                     debug(f"Page {page_number}: no document records available for evaluation; stopping collection.")
+                    log(f"📋 Page {page_number}: 0 document records — stopping further page collection.")
                     break
                 document_batch = [
                     {"id": index, **document}
@@ -1768,15 +1886,15 @@ async def run_scraping_pipeline(
                 ]
 
                 try:
-                    st.write("🕷️ BeautifulSoup: Converting fetched HTML to link-preserving text for semantic evaluation...")
+                    log("🕷️ BeautifulSoup: Converting fetched HTML to link-preserving text for semantic evaluation...")
                     markdown = await extract_markdown(raw_html)
                 except Exception:
                     debug(f"Page {page_number}: HTML-to-text extraction failed:\n{traceback.format_exc()}")
-                    st.write("This page could not be prepared for review. Continuing...")
+                    log("This page could not be prepared for review. Continuing...")
                     continue
                 if not markdown.strip():
                     debug(f"Page {page_number}: HTML-to-text extraction returned 0 characters.")
-                    st.write("No readable document content found on this page.")
+                    log("No readable document content found on this page.")
                     continue
 
                 evaluator_content = _evaluator_document_context(search_documents) or markdown
@@ -1786,8 +1904,7 @@ async def run_scraping_pipeline(
                     f"evaluator input is {len(evaluator_content)} characters."
                 )
 
-                st.write(f"🧠 LangGraph: Routing {len(search_documents)} parsed document record(s) to the CrewAI orchestrator...")
-                st.write("🤖 CrewAI: Requesting HVAC/ASHRAE semantic relevance evaluation through OpenRouter's free router (openrouter/openrouter/free)...")
+                log(f"🧠 Stage 1: Sending {len(search_documents)} document record(s) to CrewAI/OpenRouter...")
                 try:
                     graph_state = await invoke_scraper_graph(
                         {
@@ -1796,7 +1913,7 @@ async def run_scraping_pipeline(
                             "document_batch": document_batch,
                             "extracted_documents": [],
                         },
-                        on_status=st.write,
+                        on_status=log,
                     )
                     extracted_documents: list[dict[str, Any]] = graph_state.get(
                         "extracted_documents", []
@@ -1819,34 +1936,43 @@ async def run_scraping_pipeline(
                     )
                 except Exception:
                     debug(f"Page {page_number}: document evaluation failed:\n{traceback.format_exc()}")
-                    st.write("Document evaluation could not finish for this page. Continuing...")
+                    log("Document evaluation could not finish for this page. Continuing...")
                     continue
 
                 pages_processed += 1
                 documents_approved += len(approved_docs)
                 if not approved_docs:
-                    st.write("No relevant documents were approved on this page.")
+                    log("No relevant documents were approved on this page.")
                     continue
 
                 main_status.update(
-                    label=f"✅ AI Approved {len(approved_docs)} documents.",
-                    state="complete", expanded=False,
+                    label=f"✅ AI Approved {len(approved_docs)} documents on page {page_number}.",
+                    state="running", expanded=True,
                 )
                 remaining = max(target_documents - documents_downloaded - len(global_primary_jobs), 0)
+                already_stored = 0
+                recovery_retained = 0
+                queued_now = 0
+                missing_links = 0
+                log(f"📦 Page {page_number} queue decisions ({len(approved_docs[:remaining])} candidate(s)):")
                 for document in approved_docs[:remaining]:
                     title = str(document.get("title") or "Untitled document")
                     mirror_links = _document_mirror_links(document, search_rows, search_url)
                     filename = _safe_pdf_filename(title, page_number, document["id"])
                     _, destination, _ = _download_paths(filename)
                     if destination.exists():
-                        main_status.write(f"📂 Already stored: {filename}; skipping download.")
+                        already_stored += 1
+                        log(f"  📂 Already stored: {filename}; skipping download.")
                     elif filename in scheduled_filenames:
-                        main_status.write(f"♻️ Existing recovery state retained for: {filename}; avoiding a duplicate worker assignment.")
+                        recovery_retained += 1
+                        log(f"  ♻️ Existing recovery state retained for: {filename}; avoiding a duplicate worker assignment.")
                     elif not mirror_links:
+                        missing_links += 1
                         failed_urls.append(str(document.get("link") or "missing document link"))
                         with st.status(f"⬇️ Processing: {filename[:40]}...", expanded=False) as missing_status:
-                            st.write("No source link was available for this document.")
+                            missing_status.write("No source link was available for this document.")
                             missing_status.update(label=f"❌ Failed: {filename[:40]}", state="error", expanded=False)
+                        log(f"  ❌ Missing source link: {filename}")
                     else:
                         try:
                             stage1_score = int(document.get("score", 100) or 100)
@@ -1862,9 +1988,15 @@ async def run_scraping_pipeline(
                             "query": query.strip(),
                         })
                         scheduled_filenames.add(filename)
+                        queued_now += 1
+                        log(f"  ⬇️ Queued for download: {filename}")
+                log(
+                    f"📊 Page {page_number} summary: queued {queued_now} · already stored {already_stored} · "
+                    f"recovery retained {recovery_retained} · missing links {missing_links}"
+                )
 
             if global_primary_jobs:
-                main_status.write(
+                log(
                     f"⬇️ Global primary queue ready: {len(global_primary_jobs)} approved document(s); "
                     f"using up to {network.settings.max_workers} workers."
                 )
@@ -1872,7 +2004,7 @@ async def run_scraping_pipeline(
                     completed_now, failed_primary = await _download_round(
                         global_primary_jobs, network, debug, executor=download_executor,
                         round_number=1, recovery=False,
-                )
+                    )
                 documents_downloaded += completed_now
                 for result in failed_primary:
                     attempt = int(result["attempt"])
@@ -1910,12 +2042,12 @@ async def run_scraping_pipeline(
                     global_recovery_not_before - time.time(),
                 )
                 if delay:
-                    main_status.write(
+                    log(
                         f"♻️ Recovery queue ready: {len(valid_recovery_jobs)} document(s). Waiting {delay:g}s before round {recovery_round}."
                     )
                     await asyncio.sleep(delay)
                 else:
-                    main_status.write(
+                    log(
                         f"♻️ Global recovery round {recovery_round}: {len(valid_recovery_jobs)} document(s)."
                     )
                 with downloads_area:
@@ -2079,15 +2211,15 @@ with action_col:
     force_revalidation = st.checkbox("Re-validate completed PDFs", value=False)
 
 st.divider()
-st.subheader("Agent activity")
-
 stage2_counts = validation_summary(DATA_DIRECTORY)
 pending_existing = len(scan_existing_pdfs(DATA_DIRECTORY, revalidate=force_revalidation))
+st.subheader("Library status")
 st.caption(
     f"Existing PDF Scan: Found {pending_existing} pending PDF(s) · "
     f"Stage 2 Validation: Approved {stage2_counts['approved']} · Rejected {stage2_counts['rejected']} · "
     f"Pending/Error {stage2_counts['pending']}"
 )
+st.subheader("Agent activity")
 
 if scan_existing:
     try:

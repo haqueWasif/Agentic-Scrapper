@@ -27,6 +27,7 @@ class NetworkSettings:
     max_stall_seconds: int = 60
     max_document_attempts: int = 5
     recovery_round_delay_seconds: float = 5.0
+    download_queue_maxsize: int = 50
 
 
 class NetworkManager:
@@ -75,6 +76,7 @@ class NetworkManager:
             max_stall_seconds=max(1, int(number("max_stall_seconds", 60))),
             max_document_attempts=max(1, int(number("max_document_attempts", 5))),
             recovery_round_delay_seconds=max(0, number("recovery_round_delay_seconds", 5)),
+            download_queue_maxsize=max(1, int(number("download_queue_maxsize", 50))),
         )
 
     @staticmethod
