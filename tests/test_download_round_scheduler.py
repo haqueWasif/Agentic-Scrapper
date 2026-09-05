@@ -6,6 +6,7 @@ transfer itself; this file covers how completed/partial attempts are sequenced.
 """
 
 import ast
+from contextlib import contextmanager
 import asyncio
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import nullcontext
@@ -151,14 +152,14 @@ class DownloadRoundSchedulerTests(unittest.IsolatedAsyncioTestCase):
 class PersistentRecoveryStateTests(unittest.TestCase):
     def test_stale_downloading_state_becomes_recoverable_with_part_preserved(self):
         source = (Path(__file__).resolve().parents[1] / "app.py").read_text(encoding="utf-8")
-        wanted = {"_download_paths", "_load_download_state", "_save_download_state", "_recovery_candidates"}
+        wanted = {"_download_paths", "_load_download_state", "_save_download_state", "_download_state_process_lock", "_recovery_candidates"}
         nodes = [node for node in ast.parse(source).body if isinstance(node, ast.FunctionDef) and node.name in wanted]
         self.assertEqual({node.name for node in nodes}, wanted)
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             namespace = {
                 "Any": Any, "Path": Path, "json": json, "os": __import__("os"), "time": time,
-                "threading": threading, "logging": __import__("logging"),
+                "threading": threading, "tempfile": __import__("tempfile"), "contextmanager": contextmanager, "logging": __import__("logging"),
                 "DOWNLOAD_DIRECTORY": root / "ASHRAE_Files", "DOWNLOAD_STATE_FILE": root / "downloads.json",
                 "_DOWNLOAD_STATE_LOCK": threading.Lock(),
             }

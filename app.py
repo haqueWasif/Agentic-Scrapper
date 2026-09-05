@@ -2,7 +2,7 @@
 
 import asyncio
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 import hashlib
 import json
 import logging
@@ -11,6 +11,7 @@ import random
 import re
 from queue import Empty
 import shutil
+import tempfile
 import threading
 import time
 import traceback
@@ -258,12 +259,119 @@ def _load_download_state() -> dict[str, Any]:
     return {"downloads": {}}
 
 
-def _save_download_state(state: dict[str, Any]) -> None:
-    """Atomically persist the ledger so interrupted bulk runs remain resumable."""
-    DOWNLOAD_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = DOWNLOAD_STATE_FILE.with_name(DOWNLOAD_STATE_FILE.name + ".tmp")
-    temporary_path.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
-    os.replace(temporary_path, DOWNLOAD_STATE_FILE)
+@contextmanager
+def _download_state_process_lock():
+    """Cooperatively serialize the ledger transaction across app processes."""
+    lock_path = DOWNLOAD_STATE_FILE.with_name(DOWNLOAD_STATE_FILE.name + ".lock")
+    handle = None
+    acquired = False
+    try:
+        try:
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            handle = lock_path.open("a+b")
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write(b"0")
+                handle.flush()
+        except OSError as exc:
+            logging.getLogger(__name__).warning(
+                "Download state persistence temporarily failed: ledger lock unavailable: %s", exc,
+            )
+            yield False
+            return
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            try:
+                handle.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except OSError:
+                time.sleep(0.05)
+        if not acquired:
+            logging.getLogger(__name__).warning(
+                "Download state persistence temporarily failed: another process holds the ledger lock."
+            )
+        yield acquired
+    finally:
+        if acquired:
+            try:
+                handle.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+        if handle:
+            handle.close()
+
+
+def _save_download_state(state: dict[str, Any]) -> bool:
+    """Atomically persist the ledger; callers already hold ``_DOWNLOAD_STATE_LOCK``.
+
+    A unique same-directory temporary file avoids collisions between workers or
+    overlapping Streamlit runs.  The previous valid ledger remains untouched if
+    Windows briefly locks the destination during ``os.replace``.
+    """
+    temporary_path: Path | None = None
+    try:
+        DOWNLOAD_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=DOWNLOAD_STATE_FILE.parent,
+            prefix="downloads_", suffix=".tmp", delete=False,
+        ) as temporary_file:
+            temporary_path = Path(temporary_file.name)
+            json.dump(state, temporary_file, indent=2, sort_keys=True)
+            temporary_file.flush()
+            try:
+                os.fsync(temporary_file.fileno())
+            except OSError:
+                # fsync is best-effort on filesystems that do not support it;
+                # the closed-file + atomic-replace sequence is still preserved.
+                pass
+
+        for replace_attempt in range(5):
+            try:
+                os.replace(temporary_path, DOWNLOAD_STATE_FILE)
+                return True
+            except PermissionError as exc:
+                if replace_attempt == 4:
+                    logging.getLogger(__name__).warning(
+                        "Download state persistence temporarily failed after 5 replace attempts: %s", exc,
+                    )
+                    return False
+                logging.getLogger(__name__).debug(
+                    "Download state persistence temporarily locked; retry %s/5", replace_attempt + 2,
+                )
+                time.sleep(0.05 * (2 ** replace_attempt))
+            except FileNotFoundError as exc:
+                # Never recreate or replace a missing temp file: another actor
+                # may only affect its own unique path, so preserve the old ledger.
+                logging.getLogger(__name__).warning(
+                    "Download state persistence temporarily failed; temp file unavailable: %s", exc,
+                )
+                return False
+    except OSError as exc:
+        logging.getLogger(__name__).warning(
+            "Download state persistence temporarily failed before atomic replacement: %s", exc,
+        )
+        return False
+    finally:
+        if temporary_path and temporary_path.exists():
+            try:
+                temporary_path.unlink()
+            except OSError:
+                # Only our uniquely-created path is considered for cleanup.
+                pass
+    return False
 
 
 def _update_download_state(
@@ -279,57 +387,60 @@ def _update_download_state(
     completed: bool | None = None,
     retry_after_seconds: float | None = None,
     validation_status: str | None = None,
-) -> None:
+) -> bool:
     """Atomically record transfer and round-recovery state for one document."""
     with _DOWNLOAD_STATE_LOCK:
-        state = _load_download_state()
-        entry = state["downloads"].get(filename, {})
-        _, destination, part_path = _download_paths(filename)
-        current_size = int(size if size is not None else _download_size(filename))
-        previous_size = int(entry.get("bytes_downloaded", entry.get("size", 0)) or 0)
-        entry.update({
-            "filename": filename,
-            "url": url or entry.get("url", ""),
-            "status": status,
-            "size": current_size,
-            "bytes_downloaded": current_size,
-            "part_path": str(part_path),
-            "last_source": url or entry.get("last_source", entry.get("url", "")),
-            "last_progress_time": int(time.time()) if current_size > previous_size else entry.get("last_progress_time"),
-            "last_attempt_time": int(time.time()),
-            "updated_at": int(time.time()),
-        })
-        if candidate:
-            # Metadata is limited to the already-approved row information needed
-            # to refresh a mirror in a later recovery round or after an app restart.
-            entry["candidate"] = candidate
-            entry["document_id"] = str(candidate.get("document_id") or filename)
-            entry["title"] = str(candidate.get("title") or entry.get("title") or filename)
-            entry["query"] = str(candidate.get("query") or entry.get("query") or "")
-        if document_attempt is not None:
-            entry["document_attempt"] = int(document_attempt)
-        if request_attempt is not None:
-            entry["request_attempt"] = int(request_attempt)
-        if completed is not None:
-            entry["completed"] = bool(completed)
-        elif status.upper() == "COMPLETED":
-            entry["completed"] = True
-        elif status.upper() in {"QUEUED", "DOWNLOADING", "FAILED_FOR_ROUND", "RECOVERING", "PERMANENTLY_FAILED"}:
-            entry["completed"] = False
-        if retry_after_seconds is not None:
-            entry["retry_after_until"] = time.time() + max(0.0, float(retry_after_seconds))
-        elif status.upper() == "COMPLETED":
-            entry.pop("retry_after_until", None)
-        if validation_status is not None:
-            entry["validation_status"] = validation_status
-        if reason:
-            entry["reason"] = reason
-            entry["last_error"] = reason
-        else:
-            entry.pop("reason", None)
-            entry.pop("last_error", None)
-        state["downloads"][filename] = entry
-        _save_download_state(state)
+        with _download_state_process_lock() as acquired:
+            if not acquired:
+                return False
+            state = _load_download_state()
+            entry = state["downloads"].get(filename, {})
+            _, destination, part_path = _download_paths(filename)
+            current_size = int(size if size is not None else _download_size(filename))
+            previous_size = int(entry.get("bytes_downloaded", entry.get("size", 0)) or 0)
+            entry.update({
+                "filename": filename,
+                "url": url or entry.get("url", ""),
+                "status": status,
+                "size": current_size,
+                "bytes_downloaded": current_size,
+                "part_path": str(part_path),
+                "last_source": url or entry.get("last_source", entry.get("url", "")),
+                "last_progress_time": int(time.time()) if current_size > previous_size else entry.get("last_progress_time"),
+                "last_attempt_time": int(time.time()),
+                "updated_at": int(time.time()),
+            })
+            if candidate:
+                # Metadata is limited to the already-approved row information needed
+                # to refresh a mirror in a later recovery round or after an app restart.
+                entry["candidate"] = candidate
+                entry["document_id"] = str(candidate.get("document_id") or filename)
+                entry["title"] = str(candidate.get("title") or entry.get("title") or filename)
+                entry["query"] = str(candidate.get("query") or entry.get("query") or "")
+            if document_attempt is not None:
+                entry["document_attempt"] = int(document_attempt)
+            if request_attempt is not None:
+                entry["request_attempt"] = int(request_attempt)
+            if completed is not None:
+                entry["completed"] = bool(completed)
+            elif status.upper() == "COMPLETED":
+                entry["completed"] = True
+            elif status.upper() in {"QUEUED", "DOWNLOADING", "FAILED_FOR_ROUND", "RECOVERING", "PERMANENTLY_FAILED"}:
+                entry["completed"] = False
+            if retry_after_seconds is not None:
+                entry["retry_after_until"] = time.time() + max(0.0, float(retry_after_seconds))
+            elif status.upper() == "COMPLETED":
+                entry.pop("retry_after_until", None)
+            if validation_status is not None:
+                entry["validation_status"] = validation_status
+            if reason:
+                entry["reason"] = reason
+                entry["last_error"] = reason
+            else:
+                entry.pop("reason", None)
+                entry.pop("last_error", None)
+            state["downloads"][filename] = entry
+            return _save_download_state(state)
 
 
 def _download_state_entry(filename: str) -> dict[str, Any] | None:
@@ -1179,39 +1290,42 @@ def _recovery_candidates(query: str) -> list[dict[str, Any]]:
     normalized_query = query.strip().lower()
     recovered: list[dict[str, Any]] = []
     with _DOWNLOAD_STATE_LOCK:
-        state = _load_download_state()
-        changed = False
-        for filename, entry in state["downloads"].items():
-            if not isinstance(entry, dict):
-                continue
-            status = str(entry.get("status", "")).upper()
-            candidate = entry.get("candidate")
-            if status == "DOWNLOADING":
-                # A process cannot retain a live worker across a Streamlit/app
-                # restart.  Its on-disk .part remains the recovery source of truth.
-                entry["status"] = "FAILED_FOR_ROUND"
-                entry["last_error"] = "stale DOWNLOADING state recovered after restart"
-                status = "FAILED_FOR_ROUND"
-                changed = True
-            if status not in {"QUEUED", "FAILED_FOR_ROUND", "RECOVERING", "PARTIAL", "FAILED"}:
-                continue
-            if not isinstance(candidate, dict) or not candidate.get("mirrors"):
-                continue
-            if entry.get("query", "").strip().lower() not in {"", normalized_query}:
-                continue
-            _, destination, _ = _download_paths(filename)
-            if destination.exists():
-                entry["status"] = "COMPLETED"
-                entry["completed"] = True
-                entry["size"] = destination.stat().st_size
-                changed = True
-                continue
-            job = dict(candidate)
-            job["filename"] = filename
-            job["_document_attempt"] = max(1, int(entry.get("document_attempt", 0) or 0) + 1)
-            recovered.append(job)
-        if changed:
-            _save_download_state(state)
+        with _download_state_process_lock() as acquired:
+            if not acquired:
+                return recovered
+            state = _load_download_state()
+            changed = False
+            for filename, entry in state["downloads"].items():
+                if not isinstance(entry, dict):
+                    continue
+                status = str(entry.get("status", "")).upper()
+                candidate = entry.get("candidate")
+                if status == "DOWNLOADING":
+                    # A process cannot retain a live worker across a Streamlit/app
+                    # restart.  Its on-disk .part remains the recovery source of truth.
+                    entry["status"] = "FAILED_FOR_ROUND"
+                    entry["last_error"] = "stale DOWNLOADING state recovered after restart"
+                    status = "FAILED_FOR_ROUND"
+                    changed = True
+                if status not in {"QUEUED", "FAILED_FOR_ROUND", "RECOVERING", "PARTIAL", "FAILED"}:
+                    continue
+                if not isinstance(candidate, dict) or not candidate.get("mirrors"):
+                    continue
+                if entry.get("query", "").strip().lower() not in {"", normalized_query}:
+                    continue
+                _, destination, _ = _download_paths(filename)
+                if destination.exists():
+                    entry["status"] = "COMPLETED"
+                    entry["completed"] = True
+                    entry["size"] = destination.stat().st_size
+                    changed = True
+                    continue
+                job = dict(candidate)
+                job["filename"] = filename
+                job["_document_attempt"] = max(1, int(entry.get("document_attempt", 0) or 0) + 1)
+                recovered.append(job)
+            if changed:
+                _save_download_state(state)
     return recovered
 
 

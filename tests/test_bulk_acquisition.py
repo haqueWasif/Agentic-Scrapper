@@ -1,6 +1,7 @@
 """Offline checks for bulk state, skipped completed files, and partial resumption."""
 
 import ast
+from contextlib import contextmanager
 import json
 import os
 import re
@@ -24,7 +25,7 @@ class BulkAcquisitionTests(unittest.TestCase):
         names = {
             "_safe_pdf_filename", "_document_mirror_links", "_download_paths",
             "_load_download_state", "_save_download_state", "_update_download_state",
-            "_download_state_entry", "_download_size", "_bulk_keyword_match",
+            "_download_state_entry", "_download_size", "_download_state_process_lock", "_bulk_keyword_match",
             "_bulk_candidates_from_page",
         }
         nodes = [
@@ -34,7 +35,7 @@ class BulkAcquisitionTests(unittest.TestCase):
         self.assertEqual({node.name for node in nodes}, names)
         self.ns = {
             "Any": Any, "Path": Path, "os": os, "re": re, "json": json,
-            "threading": threading, "time": time, "urllib": urllib,
+            "threading": threading, "time": time, "tempfile": tempfile, "contextmanager": contextmanager, "logging": __import__("logging"), "urllib": urllib,
             "urljoin": urljoin, "urlparse": urlparse,
             "PROJECT_ROOT": root,
             "DOWNLOAD_DIRECTORY": root / "ASHRAE_Files",
