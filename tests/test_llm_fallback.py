@@ -49,6 +49,7 @@ def load_evaluator(outcomes):
         _status_messages=ContextVar('test-status', default=None),
         LLM=llm, Agent=lambda **kw: SimpleNamespace(**kw),
         Task=lambda **kw: SimpleNamespace(**kw), Crew=Crew,
+        StatelessCrew=Crew, prepare_storage=lambda: 'runtime/crewai',
     )
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), 'exec'), namespace)
     return namespace, models, crews
