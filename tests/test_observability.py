@@ -65,6 +65,12 @@ class ObservabilityTests(unittest.TestCase):
         self.assertEqual(events[-2][0], "end")
         self.assertEqual(events[-2][1]["outputs"]["approved_document_count"], 4)
 
+    def test_status_reports_enabled_and_missing_key_without_exposure(self):
+        with patch.dict(os.environ, {"LANGSMITH_TRACING": "true", "LANGSMITH_API_KEY": "test-key"}, clear=False):
+            self.assertEqual(langsmith_status(), "Enabled")
+        with patch.dict(os.environ, {"LANGSMITH_TRACING": "true", "LANGSMITH_API_KEY": ""}, clear=False):
+            self.assertEqual(langsmith_status(), "Disabled — API key not configured")
+
     def test_observability_setup_failure_does_not_block_core_operation(self):
         class BrokenClient:
             def __init__(self, **kwargs):

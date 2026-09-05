@@ -29,6 +29,7 @@ from pypdf import PdfReader
 
 from app.agents.orchestrator import invoke_pdf_validation_graph, invoke_scraper_graph
 from app.network_manager import NetworkManager
+from app.observability import langsmith_status
 from app.pdf_validation import (
     completed_validation_report,
     extract_pdf_preview,
@@ -1285,7 +1286,7 @@ async def _download_bulk_cards(candidates: list[dict[str, Any]], debug) -> int:
     return completed
 
 
-def _recovery_candidates(query: str) -> list[dict[str, Any]]:
+def _recovery_candidates(query: str, *, max_document_attempts: int = 5) -> list[dict[str, Any]]:
     """Rebuild interrupted approved jobs without repeating search or Stage 1."""
     normalized_query = query.strip().lower()
     recovered: list[dict[str, Any]] = []
@@ -1300,15 +1301,9 @@ def _recovery_candidates(query: str) -> list[dict[str, Any]]:
                     continue
                 status = str(entry.get("status", "")).upper()
                 candidate = entry.get("candidate")
-                if status == "DOWNLOADING":
-                    # A process cannot retain a live worker across a Streamlit/app
-                    # restart.  Its on-disk .part remains the recovery source of truth.
-                    entry["status"] = "FAILED_FOR_ROUND"
-                    entry["last_error"] = "stale DOWNLOADING state recovered after restart"
-                    status = "FAILED_FOR_ROUND"
-                    changed = True
                 if status not in {"QUEUED", "FAILED_FOR_ROUND", "RECOVERING", "PARTIAL", "FAILED"}:
-                    continue
+                    if status != "DOWNLOADING":
+                        continue
                 if not isinstance(candidate, dict) or not candidate.get("mirrors"):
                     continue
                 if entry.get("query", "").strip().lower() not in {"", normalized_query}:
@@ -1320,9 +1315,33 @@ def _recovery_candidates(query: str) -> list[dict[str, Any]]:
                     entry["size"] = destination.stat().st_size
                     changed = True
                     continue
+                previous_attempt = max(1, int(entry.get("document_attempt", 0) or 0))
+                if previous_attempt > max_document_attempts:
+                    entry["status"] = "PERMANENTLY_FAILED"
+                    entry["completed"] = False
+                    entry["last_error"] = "persisted document attempt exceeds configured maximum"
+                    changed = True
+                    continue
+                if status == "DOWNLOADING":
+                    # An interrupted process did not finish this document-level
+                    # attempt. Resume its .part with the same attempt number.
+                    entry["status"] = "RECOVERING"
+                    entry["last_error"] = "stale DOWNLOADING state resumed after restart"
+                    next_attempt = previous_attempt
+                    changed = True
+                elif status in {"FAILED_FOR_ROUND", "PARTIAL", "FAILED"}:
+                    if previous_attempt >= max_document_attempts:
+                        entry["status"] = "PERMANENTLY_FAILED"
+                        entry["completed"] = False
+                        entry["last_error"] = "maximum document attempts reached before restart recovery"
+                        changed = True
+                        continue
+                    next_attempt = previous_attempt + 1
+                else:  # QUEUED or RECOVERING: no completed attempt to consume.
+                    next_attempt = previous_attempt
                 job = dict(candidate)
                 job["filename"] = filename
-                job["_document_attempt"] = max(1, int(entry.get("document_attempt", 0) or 0) + 1)
+                job["_document_attempt"] = next_attempt
                 recovered.append(job)
             if changed:
                 _save_download_state(state)
@@ -1401,133 +1420,105 @@ def _download_worker(candidate: dict[str, Any], network: NetworkManager, worker_
     }
 
 
-async def _download_concurrent_cards(
-    candidates: list[dict[str, Any]], network: NetworkManager, debug, *, executor: ThreadPoolExecutor | None = None,
-) -> tuple[int, list[str]]:
-    """Run bounded primary/recovery rounds using one fixed worker pool.
+async def _download_round(
+    candidates: list[dict[str, Any]], network: NetworkManager, debug, *,
+    executor: ThreadPoolExecutor | None = None, round_number: int = 1, recovery: bool = False,
+) -> tuple[int, list[dict[str, Any]]]:
+    """Perform exactly one document-level attempt for every supplied job.
 
-    Request-level retries happen inside ``download_file``.  This scheduler only
-    retries a document after every current-round document has released its worker.
+    Request-level retries remain in ``download_file``.  Global orchestration owns
+    when failed jobs re-enter a later recovery round, so a page never consumes
+    its own recovery cycle before subsequent pages are discovered.
     """
     if not candidates:
         return 0, []
     unique_candidates: list[dict[str, Any]] = []
     seen_filenames: set[str] = set()
-    for candidate in candidates:
+    for original in candidates:
+        candidate = dict(original)
         filename = candidate["filename"]
-        if filename not in seen_filenames:
-            seen_filenames.add(filename)
-            unique_candidates.append(dict(candidate))
+        attempt = int(candidate.get("_document_attempt", 1) or 1)
+        if filename in seen_filenames:
+            continue
+        seen_filenames.add(filename)
+        if not 1 <= attempt <= network.settings.max_document_attempts:
+            _update_download_state(
+                filename, candidate.get("source_url", ""), "PERMANENTLY_FAILED",
+                size=_download_size(filename), candidate={key: value for key, value in candidate.items() if not key.startswith("_")},
+                document_attempt=min(max(attempt, 1), network.settings.max_document_attempts), completed=False,
+                reason="scheduler rejected out-of-range document attempt",
+            )
+            debug(f"Filename: {filename}\nFailure reason: out-of-range document attempt {attempt}/{network.settings.max_document_attempts}")
+            continue
+        candidate["_document_attempt"] = attempt
+        unique_candidates.append(candidate)
+    if not unique_candidates:
+        return 0, []
+
     cards = {}
     for candidate in unique_candidates:
         filename = candidate["filename"]
         with st.status(f"⬇️ Processing: {filename[:40]}...", expanded=False) as card:
             card.write("⏳ Queued for a controlled curl_cffi worker...")
             cards[filename] = (card, st.empty())
+        _update_download_state(
+            filename, candidate.get("source_url", ""), "RECOVERING" if recovery else "QUEUED",
+            size=_download_size(filename), candidate={key: value for key, value in candidate.items() if not key.startswith("_")},
+            document_attempt=int(candidate["_document_attempt"]), completed=False,
+        )
 
-    completed, failed, recovered_successfully, permanent_failures = 0, [], 0, 0
-    round_number = 1
-    current_round = unique_candidates
+    st.caption(
+        f"{'Recovery' if recovery else 'Primary'} Download Round: {round_number} · "
+        f"Configured Workers: {network.settings.max_workers} · "
+        f"Active Workers: {min(network.settings.max_workers, len(unique_candidates))} · "
+        f"Jobs: {len(unique_candidates)}"
+    )
+    completed, failed_for_round = 0, []
     executor_context = nullcontext(executor) if executor else ThreadPoolExecutor(
         max_workers=network.settings.max_workers, thread_name_prefix="pdf-download",
     )
     with executor_context as active_executor:
-        while current_round:
-            for candidate in current_round:
-                candidate.setdefault("_document_attempt", 1 if round_number == 1 else 2)
-                _update_download_state(
-                    candidate["filename"], candidate.get("source_url", ""),
-                    "RECOVERING" if round_number > 1 else "QUEUED", size=_download_size(candidate["filename"]),
-                    candidate={key: value for key, value in candidate.items() if not key.startswith("_")},
-                    document_attempt=int(candidate["_document_attempt"]), completed=False,
-                )
-            st.caption(
-                f"Download Round: {round_number} · Configured Workers: {network.settings.max_workers} · "
-                f"Active Workers: {min(network.settings.max_workers, len(current_round))} · "
-                f"Completed: {completed} · Recovery queue: {len(current_round) if round_number > 1 else 0} · "
-                f"Recovered successfully: {recovered_successfully} · Permanent failures: {permanent_failures}"
-            )
-            pending = {
-                active_executor.submit(
-                    _download_worker, candidate, network, (index % network.settings.max_workers) + 1,
-                ): candidate
-                for index, candidate in enumerate(current_round)
-            }
-            failed_for_round: list[dict[str, Any]] = []
-            recovery_not_before = 0.0
-            while pending:
-                while True:
-                    try:
-                        event = network.events.get_nowait()
-                    except Empty:
-                        break
-                    if event["filename"] not in cards:
-                        continue
-                    card, progress = cards[event["filename"]]
-                    if event["kind"] == "progress":
-                        total = event["total"]
-                        transferred = event["downloaded"]
-                        fraction = min(transferred / total, 1.0) if total else 0.0
-                        progress.progress(fraction, text=f"Worker {event['worker']}/{network.settings.max_workers}: {transferred / (1024 * 1024):.2f} MB" + (f" / {total / (1024 * 1024):.2f} MB" if total else ""))
-                    else:
-                        card.write(event["message"])
-                done, _ = wait(pending, timeout=0.2, return_when=FIRST_COMPLETED)
-                for future in done:
-                    candidate = pending.pop(future)
-                    filename = candidate["filename"]
-                    card, progress = cards[filename]
-                    progress.empty()
-                    try:
-                        result = future.result()
-                    except Exception:
-                        result = {"success": False, "candidate": candidate, "attempt": int(candidate.get("_document_attempt", 1)), "permanent": False}
-                        debug(f"Filename: {filename}\nFailure reason:\n{traceback.format_exc()}")
-                    if result["success"]:
-                        completed += 1
-                        if int(result["attempt"]) > 1:
-                            recovered_successfully += 1
-                        card.update(label=f"✅ Secured: {filename[:40]}", state="complete", expanded=False)
-                        debug(f"Filename: {filename}\nDownloaded successfully")
-                    elif result.get("permanent"):
-                        _update_download_state(
-                            filename, candidate.get("source_url", ""), "PERMANENTLY_FAILED",
-                            size=_download_size(filename), candidate={key: value for key, value in candidate.items() if not key.startswith("_")},
-                            document_attempt=int(result["attempt"]), completed=False,
-                        )
-                        permanent_failures += 1
-                        failed.extend(candidate.get("mirrors", []))
-                        card.update(label=f"❌ Failed: {filename[:40]}", state="error", expanded=False)
-                    else:
-                        _update_download_state(
-                            filename, candidate.get("source_url", ""), "FAILED_FOR_ROUND",
-                            size=_download_size(filename), candidate={key: value for key, value in candidate.items() if not key.startswith("_")},
-                            document_attempt=int(result["attempt"]), completed=False,
-                        )
-                        failed.extend(candidate.get("mirrors", []))
-                        next_candidate = dict(result["candidate"])
-                        next_candidate["_document_attempt"] = int(result["attempt"]) + 1
-                        failed_for_round.append(next_candidate)
-                        recovery_not_before = max(recovery_not_before, float(result.get("retry_after_until", 0) or 0))
-                        card.update(label=f"⚠️ Pending recovery: {filename[:40]}", state="running", expanded=False)
-                await asyncio.sleep(0)
-
-            # DOCUMENT-LEVEL RECOVERY: never recycle a failed file until every
-            # file in this round has had an opportunity to use a worker.
-            if not failed_for_round:
-                break
-            delay = max(network.settings.recovery_round_delay_seconds, recovery_not_before - time.time())
-            st.caption(
-                f"♻️ Recovery queue ready: {len(failed_for_round)} document(s). "
-                f"Waiting {delay:g}s before the next round."
-            )
-            await asyncio.sleep(delay)
-            current_round = failed_for_round
-            round_number += 1
-    st.caption(
-        f"Download run finished · Completed: {completed} · Recovered: {recovered_successfully} · "
-        f"Permanently failed: {permanent_failures}"
-    )
-    return completed, failed
+        pending = {
+            active_executor.submit(_download_worker, candidate, network, (index % network.settings.max_workers) + 1): candidate
+            for index, candidate in enumerate(unique_candidates)
+        }
+        while pending:
+            while True:
+                try:
+                    event = network.events.get_nowait()
+                except Empty:
+                    break
+                if event["filename"] not in cards:
+                    continue
+                card, progress = cards[event["filename"]]
+                if event["kind"] == "progress":
+                    total, transferred = event["total"], event["downloaded"]
+                    fraction = min(transferred / total, 1.0) if total else 0.0
+                    progress.progress(fraction, text=f"Worker {event['worker']}/{network.settings.max_workers}: {transferred / (1024 * 1024):.2f} MB" + (f" / {total / (1024 * 1024):.2f} MB" if total else ""))
+                else:
+                    card.write(event["message"])
+            done, _ = wait(pending, timeout=0.2, return_when=FIRST_COMPLETED)
+            for future in done:
+                candidate = pending.pop(future)
+                filename = candidate["filename"]
+                card, progress = cards[filename]
+                progress.empty()
+                try:
+                    result = future.result()
+                except Exception:
+                    result = {"success": False, "candidate": candidate, "attempt": int(candidate["_document_attempt"]), "permanent": False}
+                    debug(f"Filename: {filename}\nFailure reason:\n{traceback.format_exc()}")
+                if result["success"]:
+                    completed += 1
+                    card.update(label=f"✅ Secured: {filename[:40]}", state="complete", expanded=False)
+                    debug(f"Filename: {filename}\nDownloaded successfully")
+                elif result.get("permanent"):
+                    card.update(label=f"❌ Failed: {filename[:40]}", state="error", expanded=False)
+                else:
+                    failed_for_round.append(result)
+                    card.update(label=f"⚠️ Pending recovery: {filename[:40]}", state="running", expanded=False)
+            await asyncio.sleep(0)
+    return completed, failed_for_round
 
 
 def _search_cache_path(search_url: str) -> Path:
@@ -1652,6 +1643,12 @@ async def run_scraping_pipeline(
         max_workers=network.settings.max_workers, thread_name_prefix="pdf-download",
     )
     scheduled_filenames: set[str] = set()
+    global_primary_jobs: list[dict[str, Any]] = []
+    global_recovery_backlog = _recovery_candidates(
+        query, max_document_attempts=network.settings.max_document_attempts,
+    )
+    global_recovery_not_before = 0.0
+    scheduled_filenames.update(job["filename"] for job in global_recovery_backlog)
 
     def debug(message: str) -> None:
         debug_events.append(message)
@@ -1661,22 +1658,17 @@ async def run_scraping_pipeline(
 
     with pipeline_area:
         with st.status("🤖 Agentic Pipeline Initialized...", expanded=True) as main_status:
-            restart_recovery_jobs = _recovery_candidates(query)
-            if restart_recovery_jobs:
+            if global_recovery_backlog:
                 main_status.write(
-                    f"♻️ Restored {len(restart_recovery_jobs)} interrupted download(s); "
-                    "resuming their existing .part files before new retrieval."
+                    f"♻️ Restored {len(global_recovery_backlog)} interrupted download(s); "
+                    "they are queued for the global recovery round after new primary work."
                 )
-                scheduled_filenames.update(job["filename"] for job in restart_recovery_jobs)
-                with downloads_area:
-                    completed_now, failed_now = await _download_concurrent_cards(
-                        restart_recovery_jobs, network, debug, executor=download_executor,
-                    )
-                documents_downloaded += completed_now
-                failed_urls.extend(failed_now)
             for page_number in range(1, max_pages + 1):
-                if documents_downloaded >= target_documents:
-                    debug(f"Target of {target_documents} completed files reached; stopping page collection.")
+                if documents_downloaded + len(global_primary_jobs) >= target_documents:
+                    debug(
+                        f"Target of {target_documents} is satisfied by completed files and the global primary queue; "
+                        "stopping new page collection without discarding recovery backlog."
+                    )
                     break
                 main_status.update(
                     label=f"🤖 Researching page {page_number} of {max_pages}...",
@@ -1840,8 +1832,7 @@ async def run_scraping_pipeline(
                     label=f"✅ AI Approved {len(approved_docs)} documents.",
                     state="complete", expanded=False,
                 )
-                download_jobs = []
-                remaining = max(target_documents - documents_downloaded, 0)
+                remaining = max(target_documents - documents_downloaded - len(global_primary_jobs), 0)
                 for document in approved_docs[:remaining]:
                     title = str(document.get("title") or "Untitled document")
                     mirror_links = _document_mirror_links(document, search_rows, search_url)
@@ -1861,7 +1852,7 @@ async def run_scraping_pipeline(
                             stage1_score = int(document.get("score", 100) or 100)
                         except (TypeError, ValueError):
                             stage1_score = 100
-                        download_jobs.append({
+                        global_primary_jobs.append({
                             "filename": filename,
                             "mirrors": mirror_links,
                             "source_url": str(document.get("link") or ""),
@@ -1871,12 +1862,89 @@ async def run_scraping_pipeline(
                             "query": query.strip(),
                         })
                         scheduled_filenames.add(filename)
+
+            if global_primary_jobs:
+                main_status.write(
+                    f"⬇️ Global primary queue ready: {len(global_primary_jobs)} approved document(s); "
+                    f"using up to {network.settings.max_workers} workers."
+                )
                 with downloads_area:
-                    completed_now, failed_now = await _download_concurrent_cards(
-                        download_jobs, network, debug, executor=download_executor,
+                    completed_now, failed_primary = await _download_round(
+                        global_primary_jobs, network, debug, executor=download_executor,
+                        round_number=1, recovery=False,
+                )
+                documents_downloaded += completed_now
+                for result in failed_primary:
+                    attempt = int(result["attempt"])
+                    candidate = dict(result["candidate"])
+                    if attempt < network.settings.max_document_attempts:
+                        candidate["_document_attempt"] = attempt + 1
+                        global_recovery_backlog.append(candidate)
+                        global_recovery_not_before = max(
+                            global_recovery_not_before, float(result.get("retry_after_until", 0) or 0),
+                        )
+                    else:
+                        failed_urls.extend(candidate.get("mirrors", []))
+
+            recovery_round = 1
+            recovered_successfully = 0
+            while global_recovery_backlog:
+                valid_recovery_jobs: list[dict[str, Any]] = []
+                for candidate in global_recovery_backlog:
+                    attempt = int(candidate.get("_document_attempt", 1) or 1)
+                    if 1 <= attempt <= network.settings.max_document_attempts:
+                        valid_recovery_jobs.append(candidate)
+                    else:
+                        _update_download_state(
+                            candidate["filename"], candidate.get("source_url", ""), "PERMANENTLY_FAILED",
+                            size=_download_size(candidate["filename"]),
+                            candidate={key: value for key, value in candidate.items() if not key.startswith("_")},
+                            document_attempt=min(max(attempt, 1), network.settings.max_document_attempts),
+                            completed=False, reason="recovery attempt exceeds configured maximum",
+                        )
+                        failed_urls.extend(candidate.get("mirrors", []))
+                if not valid_recovery_jobs:
+                    break
+                delay = max(
+                    network.settings.recovery_round_delay_seconds,
+                    global_recovery_not_before - time.time(),
+                )
+                if delay:
+                    main_status.write(
+                        f"♻️ Recovery queue ready: {len(valid_recovery_jobs)} document(s). Waiting {delay:g}s before round {recovery_round}."
                     )
-                    documents_downloaded += completed_now
-                    failed_urls.extend(failed_now)
+                    await asyncio.sleep(delay)
+                else:
+                    main_status.write(
+                        f"♻️ Global recovery round {recovery_round}: {len(valid_recovery_jobs)} document(s)."
+                    )
+                with downloads_area:
+                    completed_now, failed_recovery = await _download_round(
+                        valid_recovery_jobs, network, debug, executor=download_executor,
+                        round_number=recovery_round, recovery=True,
+                    )
+                documents_downloaded += completed_now
+                recovered_successfully += completed_now
+                next_recovery_backlog: list[dict[str, Any]] = []
+                next_recovery_not_before = 0.0
+                for result in failed_recovery:
+                    attempt = int(result["attempt"])
+                    candidate = dict(result["candidate"])
+                    if attempt >= network.settings.max_document_attempts:
+                        _update_download_state(
+                            candidate["filename"], candidate.get("source_url", ""), "PERMANENTLY_FAILED",
+                            size=_download_size(candidate["filename"]),
+                            candidate={key: value for key, value in candidate.items() if not key.startswith("_")},
+                            document_attempt=attempt, completed=False,
+                        )
+                        failed_urls.extend(candidate.get("mirrors", []))
+                        continue
+                    candidate["_document_attempt"] = attempt + 1
+                    next_recovery_backlog.append(candidate)
+                    next_recovery_not_before = max(next_recovery_not_before, float(result.get("retry_after_until", 0) or 0))
+                global_recovery_backlog = next_recovery_backlog
+                global_recovery_not_before = next_recovery_not_before
+                recovery_round += 1
 
             if pages_processed or documents_downloaded >= target_documents:
                 final_label = (
@@ -2000,6 +2068,7 @@ with summary_col:
         f'Query: "{search_query or "Not set"}" · Page limit: {max_pages} · '
         f"Target: {target_documents}"
     )
+    st.caption(f"LangSmith tracing: {langsmith_status()}")
 with action_col:
     start_scraping = st.button(
         "Start Scraping",

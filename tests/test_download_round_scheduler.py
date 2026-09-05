@@ -65,7 +65,7 @@ class DownloadRoundSchedulerTests(unittest.IsolatedAsyncioTestCase):
         nodes = [
             node for node in ast.parse(source).body
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and node.name == "_download_concurrent_cards"
+            and node.name == "_download_round"
         ]
         self.assertEqual(len(nodes), 1)
         self.calls = []
@@ -93,7 +93,7 @@ class DownloadRoundSchedulerTests(unittest.IsolatedAsyncioTestCase):
             "_update_download_state": update,
         }
         exec(compile(ast.Module(body=nodes, type_ignores=[]), "app.py", "exec"), namespace)
-        self.scheduler = namespace["_download_concurrent_cards"]
+        self.scheduler = namespace["_download_round"]
 
     def _install_worker(self, outcome):
         def worker(candidate, network, worker_id):
@@ -123,20 +123,70 @@ class DownloadRoundSchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(failed, [])
         self.assertEqual(set(self.calls), {(f"doc-{index}.pdf", 1) for index in range(10)})
 
-    async def test_partial_failure_waits_for_round_then_recovers(self):
+    async def test_primary_failure_is_returned_for_later_global_recovery(self):
         self._install_worker(lambda filename, attempt: filename != "A.pdf" or attempt == 2)
-        completed, _ = await self.scheduler(self._jobs(["A.pdf", "B.pdf", "C.pdf"]), self.network, lambda message: None)
-        self.assertEqual(completed, 3)
+        completed, failed = await self.scheduler(self._jobs(["A.pdf", "B.pdf", "C.pdf"]), self.network, lambda message: None)
+        self.assertEqual(completed, 2)
         self.assertEqual(self.calls[:3], [("A.pdf", 1), ("B.pdf", 1), ("C.pdf", 1)])
+        self.assertEqual(len(failed), 1)
+        recovery_job = dict(failed[0]["candidate"])
+        recovery_job["_document_attempt"] = 2
+        completed, failed = await self.scheduler([recovery_job], self.network, lambda message: None, round_number=1, recovery=True)
+        self.assertEqual((completed, failed), (1, []))
         self.assertEqual(self.calls[3:], [("A.pdf", 2)])
-        self.assertTrue(any(filename == "A.pdf" and status == "FAILED_FOR_ROUND" for filename, status, _ in self.states))
 
     async def test_repeated_failures_stop_at_configured_document_limit(self):
         self._install_worker(lambda filename, attempt: False)
-        completed, _ = await self.scheduler(self._jobs(["A.pdf"]), self.network, lambda message: None)
+        current = self._jobs(["A.pdf"])
+        completed = 0
+        for attempt in range(1, 6):
+            round_completed, failed = await self.scheduler(current, self.network, lambda message: None, round_number=attempt, recovery=attempt > 1)
+            completed += round_completed
+            current = [] if not failed else [dict(failed[0]["candidate"], _document_attempt=attempt + 1)]
         self.assertEqual(completed, 0)
         self.assertEqual(self.calls, [("A.pdf", attempt) for attempt in range(1, 6)])
-        self.assertTrue(any(filename == "A.pdf" and status == "PERMANENTLY_FAILED" for filename, status, _ in self.states))
+
+    async def test_three_primary_batches_form_one_global_recovery_backlog(self):
+        failures = {"B.pdf", "F.pdf", "J.pdf"}
+        self._install_worker(lambda filename, attempt: filename not in failures or attempt == 2)
+        backlog = []
+        for batch in (["A.pdf", "B.pdf", "C.pdf", "D.pdf"], ["E.pdf", "F.pdf", "G.pdf", "H.pdf"], ["I.pdf", "J.pdf", "K.pdf"]):
+            _, failed = await self.scheduler(self._jobs(batch), self.network, lambda message: None)
+            backlog.extend(failed)
+        self.assertEqual([result["candidate"]["filename"] for result in backlog], ["B.pdf", "F.pdf", "J.pdf"])
+        recovery = [dict(result["candidate"], _document_attempt=2) for result in backlog]
+        completed, failed = await self.scheduler(recovery, self.network, lambda message: None, round_number=1, recovery=True)
+        self.assertEqual((completed, failed), (3, []))
+
+    async def test_restored_job_waits_while_twenty_new_primary_jobs_run(self):
+        self._install_worker(lambda filename, attempt: True)
+        primary = self._jobs([f"new-{index}.pdf" for index in range(20)])
+        restored = {"filename": "restored.pdf", "mirrors": ["https://example.test/restored"], "source_url": "https://example.test/book", "_document_attempt": 4}
+        completed, failed = await self.scheduler(primary, self.network, lambda message: None)
+        self.assertEqual((completed, failed), (20, []))
+        self.assertNotIn(("restored.pdf", 4), self.calls)
+        completed, failed = await self.scheduler([restored], self.network, lambda message: None, round_number=1, recovery=True)
+        self.assertEqual((completed, failed), (1, []))
+        self.assertEqual(self.calls[-1], ("restored.pdf", 4))
+
+    async def test_ten_jobs_never_exceed_five_active_workers(self):
+        active = max_active = 0
+        active_lock = threading.Lock()
+
+        def bounded_worker(candidate, network, worker_id):
+            nonlocal active, max_active
+            with active_lock:
+                active += 1
+                max_active = max(max_active, active)
+            time.sleep(0.02)
+            with active_lock:
+                active -= 1
+            return {"success": True, "candidate": candidate, "attempt": int(candidate.get("_document_attempt", 1))}
+
+        self.scheduler.__globals__["_download_worker"] = bounded_worker
+        completed, failed = await self.scheduler(self._jobs([f"doc-{index}.pdf" for index in range(10)]), self.network, lambda message: None)
+        self.assertEqual((completed, failed), (10, []))
+        self.assertLessEqual(max_active, 5)
 
     async def test_slow_but_successful_worker_is_not_cut_off_by_scheduler(self):
         def slow_success(filename, attempt):
@@ -174,10 +224,30 @@ class PersistentRecoveryStateTests(unittest.TestCase):
                 },
             }})
             jobs = namespace["_recovery_candidates"]("ASHRAE")
-            self.assertEqual(jobs[0]["_document_attempt"], 2)
+            self.assertEqual(jobs[0]["_document_attempt"], 1)
             self.assertEqual(part.read_bytes(), b"partial bytes")
             persisted = namespace["_load_download_state"]()["downloads"]["A.pdf"]
-            self.assertEqual(persisted["status"], "FAILED_FOR_ROUND")
+            self.assertEqual(persisted["status"], "RECOVERING")
+
+    def test_maxed_failed_state_is_never_returned_as_attempt_six(self):
+        source = (Path(__file__).resolve().parents[1] / "app.py").read_text(encoding="utf-8")
+        wanted = {"_download_paths", "_load_download_state", "_save_download_state", "_download_state_process_lock", "_recovery_candidates"}
+        nodes = [node for node in ast.parse(source).body if isinstance(node, ast.FunctionDef) and node.name in wanted]
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            namespace = {
+                "Any": Any, "Path": Path, "json": json, "os": __import__("os"), "time": time,
+                "threading": threading, "tempfile": __import__("tempfile"), "contextmanager": contextmanager, "logging": __import__("logging"),
+                "DOWNLOAD_DIRECTORY": root / "ASHRAE_Files", "DOWNLOAD_STATE_FILE": root / "downloads.json",
+                "_DOWNLOAD_STATE_LOCK": threading.Lock(),
+            }
+            exec(compile(ast.Module(body=nodes, type_ignores=[]), "app.py", "exec"), namespace)
+            namespace["_save_download_state"]({"downloads": {"A.pdf": {
+                "filename": "A.pdf", "status": "FAILED_FOR_ROUND", "document_attempt": 5,
+                "candidate": {"filename": "A.pdf", "mirrors": ["https://example.test/A"], "query": "ASHRAE"}, "query": "ASHRAE",
+            }}})
+            self.assertEqual(namespace["_recovery_candidates"]("ASHRAE", max_document_attempts=5), [])
+            self.assertEqual(namespace["_load_download_state"]()["downloads"]["A.pdf"]["status"], "PERMANENTLY_FAILED")
 
 
 class DownloadWorkerHandoffTests(unittest.TestCase):

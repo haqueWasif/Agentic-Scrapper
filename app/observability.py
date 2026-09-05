@@ -36,7 +36,12 @@ def langsmith_settings() -> LangSmithSettings:
 
 def langsmith_status() -> str:
     """Return a UI-safe status label that never includes credentials."""
-    return "Enabled" if langsmith_settings().enabled else "Disabled"
+    settings = langsmith_settings()
+    if settings.enabled:
+        return "Enabled"
+    if os.getenv("LANGSMITH_TRACING", "false").strip().lower() == "true" and not settings.api_key:
+        return "Disabled — API key not configured"
+    return "Disabled"
 
 
 def trace_operation(
