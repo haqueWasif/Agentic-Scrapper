@@ -30,7 +30,8 @@ from pypdf import PdfReader
 from app.agents.orchestrator import invoke_pdf_validation_graph, invoke_scraper_graph
 from app.network_manager import NetworkManager
 from app.observability import langsmith_status
-from app.pipeline_scheduler import DownloadOutcome, GlobalDownloadQueue
+from app.pipeline_events import PipelineEventBus, RunMetrics
+from app.pipeline_scheduler import BoundedWorkQueue, DownloadOutcome, GlobalDownloadQueue, GlobalRecoveryBacklog
 from app.pipeline_state import lifecycle_view, stable_document_id
 from app.pdf_validation import (
     completed_validation_report,
@@ -55,9 +56,10 @@ SEARCH_TIMEOUT_SECONDS = 45
 SEARCH_RETRIES = 2
 DEFAULT_MODE = "research"
 VALIDATION_TIMEOUT_SECONDS = 3
-VALIDATION_WORKERS = 2
 _DOWNLOAD_STATE_LOCK = threading.Lock()
-_VALIDATION_EXECUTOR = ThreadPoolExecutor(max_workers=VALIDATION_WORKERS, thread_name_prefix="pdf-validation")
+_VALIDATION_QUEUE: BoundedWorkQueue | None = None
+_VALIDATION_QUEUE_LOCK = threading.Lock()
+_PIPELINE_EVENTS = PipelineEventBus()
 BROWSER_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
@@ -75,6 +77,20 @@ CORE_ASHRAE_STANDARDS = [
     "15", "23", "30", "34", "55", "62.1", "62.2",
     "90.1", "90.2", "135", "154", "170", "180", "181", "189.1",
 ]
+
+
+def _emit_pipeline_event(kind: str, *, candidate: dict[str, Any] | None = None, filename: str = "",
+                         count: int = 1, message: str = "", **fields: Any) -> None:
+    """Publish lifecycle telemetry without allowing worker threads to call Streamlit."""
+    source = candidate or {}
+    _PIPELINE_EVENTS.emit(
+        kind,
+        run_id=str(source.get("run_id") or fields.pop("run_id", "")),
+        filename=filename or str(source.get("filename") or ""),
+        count=count,
+        message=message,
+        **fields,
+    )
 
 
 def verify_ashrae_relevance(file_path, filename, query_terms, core_standards):
@@ -428,7 +444,7 @@ def _update_download_state(
                 entry["completed"] = bool(completed)
             elif status.upper() == "COMPLETED":
                 entry["completed"] = True
-            elif status.upper() in {"QUEUED", "DOWNLOADING", "FAILED_FOR_ROUND", "RECOVERING", "PERMANENTLY_FAILED"}:
+            elif status.upper() in {"QUEUED", "DOWNLOADING", "FAILED_FOR_ROUND", "RECOVERING", "PERMANENTLY_FAILED", "STAGE1_REJECTED"}:
                 entry["completed"] = False
             if retry_after_seconds is not None:
                 entry["retry_after_until"] = time.time() + max(0.0, float(retry_after_seconds))
@@ -476,6 +492,111 @@ def _completed_download_count() -> int:
             _update_download_state(path.name, "", "COMPLETED", size=path.stat().st_size, completed=True)
         completed += 1
     return completed
+
+
+def _stage1_completed_document_ids() -> set[str]:
+    """Return durable identities already through Stage 1 for idempotent reruns."""
+    with _DOWNLOAD_STATE_LOCK:
+        records = _load_download_state().get("downloads", {}).values()
+    completed: set[str] = set()
+    for entry in records:
+        if not isinstance(entry, dict):
+            continue
+        lifecycle = entry.get("lifecycle") if isinstance(entry.get("lifecycle"), dict) else {}
+        stage1 = lifecycle.get("stage1") if isinstance(lifecycle.get("stage1"), dict) else {}
+        if stage1.get("completed") and entry.get("document_id"):
+            completed.add(str(entry["document_id"]))
+    return completed
+
+
+def _pdf_sha256(file_path: Path) -> str:
+    """Hash completed content incrementally without loading large PDFs into memory."""
+    digest = hashlib.sha256()
+    with file_path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _record_completed_content_hash(filename: str) -> dict[str, Any] | None:
+    """Persist a PDF hash and return its canonical-content relationship.
+
+    The PDF is never removed.  A later Stage 2 worker can use this compact
+    result to avoid a second extraction/LLM evaluation for byte-identical data.
+    """
+    _, destination, _ = _download_paths(filename)
+    if not destination.exists():
+        return None
+    try:
+        digest = _pdf_sha256(destination)
+    except OSError as exc:
+        logging.getLogger(__name__).warning("Could not hash completed PDF %s: %s", filename, type(exc).__name__)
+        return None
+    with _DOWNLOAD_STATE_LOCK:
+        with _download_state_process_lock() as acquired:
+            if not acquired:
+                return {"sha256": digest, "duplicate_of": None, "canonical_filename": None, "canonical_validation_status": None}
+            state = _load_download_state()
+            entry = state["downloads"].get(filename)
+            if not isinstance(entry, dict):
+                return {"sha256": digest, "duplicate_of": None, "canonical_filename": None, "canonical_validation_status": None}
+            duplicate_of = None
+            canonical_filename = None
+            canonical_validation_status = None
+            for other_filename, other in state["downloads"].items():
+                if other_filename == filename or not isinstance(other, dict):
+                    continue
+                if other.get("content_sha256") == digest and str(other.get("status", "")).upper() == "COMPLETED":
+                    duplicate_of = str(other.get("document_id") or other_filename)
+                    canonical_filename = other_filename
+                    canonical_validation_status = str(other.get("validation_status") or "PENDING").upper()
+                    break
+            entry["content_sha256"] = digest
+            if duplicate_of:
+                entry["duplicate_of"] = duplicate_of
+            else:
+                entry.pop("duplicate_of", None)
+            lifecycle = entry.get("lifecycle") if isinstance(entry.get("lifecycle"), dict) else {}
+            download_lifecycle = lifecycle.get("download") if isinstance(lifecycle.get("download"), dict) else {}
+            entry["lifecycle"] = {
+                **lifecycle,
+                "download": {**download_lifecycle, "content_sha256": digest, "duplicate_of": duplicate_of},
+            }
+            _save_download_state(state)
+    return {
+        "sha256": digest,
+        "duplicate_of": duplicate_of,
+        "canonical_filename": canonical_filename,
+        "canonical_validation_status": canonical_validation_status,
+    }
+
+
+def _propagate_duplicate_validation(canonical_filename: str, validation_status: str) -> int:
+    """Copy a terminal canonical Stage 2 result to matching duplicate records."""
+    status = str(validation_status).upper()
+    if status not in {"APPROVED", "REJECTED"}:
+        return 0
+    canonical_entry = _download_state_entry(canonical_filename) or {}
+    canonical_id = str(canonical_entry.get("document_id") or canonical_filename)
+    with _DOWNLOAD_STATE_LOCK:
+        duplicates = [
+            {"filename": str(entry.get("filename")), "candidate": dict(entry.get("candidate") or {})}
+            for entry in _load_download_state().get("downloads", {}).values()
+            if isinstance(entry, dict)
+            and str(entry.get("duplicate_of") or "") == canonical_id
+            and str(entry.get("validation_status") or "").upper() == "DUPLICATE_PENDING"
+        ]
+    event_emitter = globals().get("_emit_pipeline_event")
+    for duplicate in duplicates:
+        filename = duplicate["filename"]
+        _update_download_state(
+            filename, "", "COMPLETED", size=_download_size(filename), completed=True,
+            validation_status=status,
+            reason=f"Byte-identical to {canonical_filename}; inherited canonical Stage 2 {status.lower()} result",
+        )
+        if callable(event_emitter):
+            event_emitter(f"STAGE2_{status}", candidate=duplicate["candidate"], filename=filename)
+    return len(duplicates)
 
 
 def _download_size(filename: str) -> int:
@@ -1212,31 +1333,26 @@ def _validate_pdf_stage2(
     return validation_report
 
 
-def _schedule_validation(filename: str, *, stage1_score: int | None = 100) -> None:
-    """Queue Stage 2 after a new download so transfer workers remain non-blocking."""
+def _run_validation_job(job: dict[str, Any], worker_id: int) -> None:
+    """Execute an existing Stage 2 validation after bounded queue admission."""
+    filename = str(job["filename"])
+    stage1_score = job.get("stage1_score", 100)
+    event_candidate = {"run_id": str(job.get("run_id") or ""), "filename": filename}
+    event_emitter = globals().get("_emit_pipeline_event")
     _, destination, _ = _download_paths(filename)
     if not destination.exists():
         return
     _update_download_state(
         filename, "", "COMPLETED", size=destination.stat().st_size,
-        completed=True, validation_status="PENDING",
+        completed=True, validation_status="RUNNING",
     )
-    logging.getLogger(__name__).info("Validation queued for %s", filename)
-
-    def validate() -> None:
-        try:
-            _validate_pdf_stage2(destination, "new_download", stage1_score=stage1_score)
-        except Exception as exc:
-            _update_download_state(
-                filename, "", "COMPLETED", size=_download_size(filename), completed=True,
-                validation_status="PENDING", reason=f"validation error: {type(exc).__name__}",
-            )
-            logging.getLogger(__name__).warning("Validation pending for %s: %s", filename, type(exc).__name__)
-
-    future = _VALIDATION_EXECUTOR.submit(validate)
+    if callable(event_emitter):
+        event_emitter("STAGE2_STARTED", candidate=event_candidate, filename=filename,
+                       message=f"Stage 2 worker {worker_id} started {filename}")
+    completed = threading.Event()
 
     def mark_pending_if_slow() -> None:
-        if not future.done():
+        if not completed.is_set():
             _update_download_state(
                 filename, "", "COMPLETED", size=_download_size(filename), completed=True,
                 validation_status="PENDING", reason="validation exceeded timeout",
@@ -1246,6 +1362,124 @@ def _schedule_validation(filename: str, *, stage1_score: int | None = 100) -> No
     timer = threading.Timer(VALIDATION_TIMEOUT_SECONDS, mark_pending_if_slow)
     timer.daemon = True
     timer.start()
+    try:
+        content_hasher = globals().get("_record_completed_content_hash")
+        content_record = None
+        if callable(content_hasher):
+            content_record = content_hasher(filename)
+        if isinstance(content_record, dict) and content_record.get("duplicate_of"):
+            canonical_filename = str(content_record.get("canonical_filename") or content_record["duplicate_of"])
+            canonical_status = str(content_record.get("canonical_validation_status") or "PENDING").upper()
+            inherited_status = canonical_status if canonical_status in {"APPROVED", "REJECTED"} else "DUPLICATE_PENDING"
+            _update_download_state(
+                filename, "", "COMPLETED", size=_download_size(filename), completed=True,
+                validation_status=inherited_status,
+                reason=(
+                    f"Byte-identical to {canonical_filename}; inherited canonical Stage 2 {canonical_status.lower()} result"
+                    if inherited_status != "DUPLICATE_PENDING" else
+                    f"Byte-identical to {canonical_filename}; waiting for its Stage 2 result"
+                ),
+            )
+            logging.getLogger(__name__).info(
+                "Skipped duplicate Stage 2 validation for %s; canonical content is %s", filename, canonical_filename,
+            )
+            if callable(event_emitter):
+                event_emitter("DUPLICATE_DETECTED", candidate=event_candidate, filename=filename)
+                event_emitter(
+                    "STAGE2_DUPLICATE_PENDING" if inherited_status == "DUPLICATE_PENDING" else f"STAGE2_{inherited_status}",
+                    candidate=event_candidate, filename=filename,
+                    message=f"Duplicate content linked to {canonical_filename}",
+                )
+            return
+        validation = _validate_pdf_stage2(destination, "new_download", stage1_score=stage1_score)
+        propagator = globals().get("_propagate_duplicate_validation")
+        if callable(propagator):
+            propagator(filename, str(validation.get("status") or "PENDING"))
+        if callable(event_emitter):
+            validation_status = str(validation.get("status") or "PENDING").upper()
+            event_emitter(
+                f"STAGE2_{validation_status}" if validation_status in {"APPROVED", "REJECTED"} else "STAGE2_PENDING",
+                candidate=event_candidate, filename=filename,
+            )
+    except Exception as exc:
+        _update_download_state(
+            filename, "", "COMPLETED", size=_download_size(filename), completed=True,
+            validation_status="PENDING", reason=f"validation error: {type(exc).__name__}",
+        )
+        logging.getLogger(__name__).warning("Validation pending for %s: %s", filename, type(exc).__name__)
+    finally:
+        completed.set()
+        timer.cancel()
+
+
+def _validation_queue() -> BoundedWorkQueue:
+    """Create exactly one bounded Stage 2 pool per Python process."""
+    global _VALIDATION_QUEUE
+    with _VALIDATION_QUEUE_LOCK:
+        if _VALIDATION_QUEUE is None:
+            settings = NetworkManager._read_settings(PROJECT_ROOT / "config" / "settings.yaml")
+            _VALIDATION_QUEUE = BoundedWorkQueue(
+                _run_validation_job,
+                max_workers=settings.validation_workers,
+                maxsize=settings.stage2_queue_maxsize,
+                thread_name_prefix="pdf-validation",
+            )
+        return _VALIDATION_QUEUE
+
+
+def _schedule_validation(filename: str, *, stage1_score: int | None = 100) -> bool:
+    """Release a completed PDF into the bounded Stage 2 queue, never blocking download workers."""
+    _, destination, _ = _download_paths(filename)
+    if not destination.exists():
+        return False
+    existing = _download_state_entry(filename) or {}
+    validation_status = str(existing.get("validation_status") or "").upper()
+    if validation_status in {"APPROVED", "REJECTED"}:
+        return True
+    queue = _validation_queue()
+    if queue.contains(filename):
+        return True
+    run_id = str((existing.get("candidate") or {}).get("run_id") or "")
+    job = {"filename": filename, "stage1_score": stage1_score, "run_id": run_id, "_queue_key": filename}
+    # Persist admission before handing the job to a fast worker, so RUNNING can
+    # never be overwritten by a delayed QUEUED state update.
+    _update_download_state(
+        filename, "", "COMPLETED", size=destination.stat().st_size,
+        completed=True, validation_status="QUEUED",
+    )
+    if queue.try_enqueue(job, key=filename):
+        logging.getLogger(__name__).info("Validation queued for %s", filename)
+        event_emitter = globals().get("_emit_pipeline_event")
+        if callable(event_emitter):
+            event_emitter("STAGE2_QUEUED", candidate=job, filename=filename)
+        return True
+    _update_download_state(
+        filename, "", "COMPLETED", size=destination.stat().st_size,
+        completed=True, validation_status="PENDING", reason="Stage 2 queue is at configured capacity",
+    )
+    logging.getLogger(__name__).info("Validation pending for %s: bounded queue is full", filename)
+    event_emitter = globals().get("_emit_pipeline_event")
+    if callable(event_emitter):
+        event_emitter("STAGE2_PENDING", candidate=job, filename=filename, message="Stage 2 queue capacity reached")
+    return False
+
+
+def _restore_pending_validation_jobs() -> int:
+    """Reconstruct only incomplete Stage 2 work after restart; never redownload."""
+    scheduled = 0
+    with _DOWNLOAD_STATE_LOCK:
+        entries = [dict(entry) for entry in _load_download_state().get("downloads", {}).values() if isinstance(entry, dict)]
+    for entry in entries:
+        if str(entry.get("status", "")).upper() != "COMPLETED":
+            continue
+        if str(entry.get("validation_status") or "PENDING").upper() in {
+            "APPROVED", "REJECTED", "RUNNING", "DUPLICATE_PENDING",
+        }:
+            continue
+        filename = str(entry.get("filename") or "")
+        if filename and _schedule_validation(filename, stage1_score=entry.get("candidate", {}).get("stage1_score", 100)):
+            scheduled += 1
+    return scheduled
 
 
 def scan_and_validate_existing_pdfs(on_status, *, revalidate: bool = False) -> dict[str, int]:
@@ -1369,10 +1603,27 @@ def _download_worker(candidate: dict[str, Any], network: NetworkManager, worker_
     document_attempt = int(candidate.get("_document_attempt", 1) or 1)
     max_attempts = network.settings.max_document_attempts
     state_candidate = {key: value for key, value in candidate.items() if not key.startswith("_")}
+    event_emitter = globals().get("_emit_pipeline_event")
+    if not 1 <= document_attempt <= max_attempts:
+        _update_download_state(
+            filename, candidate.get("source_url", ""), "PERMANENTLY_FAILED", size=_download_size(filename),
+            candidate=state_candidate,
+            document_attempt=min(max(document_attempt, 1), max_attempts), completed=False,
+            reason="download worker rejected out-of-range document attempt",
+        )
+        return {
+            "success": False, "candidate": candidate,
+            "attempt": min(max(document_attempt, 1), max_attempts), "permanent": True,
+        }
     _update_download_state(
         filename, candidate.get("source_url", ""), "DOWNLOADING", size=_download_size(filename),
         candidate=state_candidate, document_attempt=document_attempt, request_attempt=0, completed=False,
     )
+    if callable(event_emitter):
+        event_emitter(
+            "DOWNLOAD_STARTED", candidate=state_candidate, filename=filename,
+            message=f"Download worker {worker_id} started {filename}", attempt=document_attempt,
+        )
     proxy = network.begin_download(worker_id, filename)
 
     def status(message: str) -> None:
@@ -1403,6 +1654,8 @@ def _download_worker(candidate: dict[str, Any], network: NetworkManager, worker_
                 )
                 _schedule_validation(filename, stage1_score=candidate.get("stage1_score", 100))
                 network.emit("success", worker_id, filename, "Downloaded successfully; Stage 2 PDF validation queued.")
+                if callable(event_emitter):
+                    event_emitter("DOWNLOAD_COMPLETED", candidate=state_candidate, filename=filename)
                 return {"success": True, "candidate": candidate, "attempt": document_attempt}
             if result == "retry_next":
                 last_reason = f"source {mirror_attempt} did not complete within its request retry budget"
@@ -1427,6 +1680,11 @@ def _download_worker(candidate: dict[str, Any], network: NetworkManager, worker_
         f"⚠️ Download attempt ended\nDocument: {filename}\nAttempt: {document_attempt}/{max_attempts}\n"
         f"Downloaded: {_download_size(filename) / (1024 * 1024):.2f} MB\nReason: {last_reason}\nAction: {action}",
     )
+    if callable(event_emitter):
+        event_emitter(
+            "DOWNLOAD_PERMANENTLY_FAILED" if final_status == "PERMANENTLY_FAILED" else "DOWNLOAD_FAILED_FOR_ROUND",
+            candidate=state_candidate, filename=filename, message=last_reason, attempt=document_attempt,
+        )
     state_entry = _download_state_entry(filename) or {}
     return {
         "success": False, "candidate": candidate, "attempt": document_attempt,
@@ -1569,9 +1827,8 @@ class _StreamlitDownloadCoordinator:
 
     async def enqueue(self, candidate: dict[str, Any], *, recovery: bool = False) -> None:
         """Apply backpressure without blocking the search producer's event loop."""
-        while not self.queue.try_enqueue(candidate):
-            self.drain()
-            await asyncio.sleep(0.1)
+        # Persist and render before admission: a fast worker must never have its
+        # DOWNLOADING transition overwritten by a late QUEUED transition.
         self._card(candidate, recovery=recovery)
         _update_download_state(
             candidate["filename"], candidate.get("source_url", ""),
@@ -1580,6 +1837,9 @@ class _StreamlitDownloadCoordinator:
             candidate={key: value for key, value in candidate.items() if not key.startswith("_")},
             document_attempt=int(candidate.get("_document_attempt", 1) or 1), completed=False,
         )
+        while not self.queue.try_enqueue(candidate):
+            self.drain()
+            await asyncio.sleep(0.1)
 
     def drain(self) -> list[dict[str, Any]]:
         """Render worker events and collect failures for a later recovery round."""
@@ -1752,21 +2012,37 @@ async def run_scraping_pipeline(
     failed_urls: list[str] = []
     debug_events: list[str] = []
     network = NetworkManager(PROJECT_ROOT)
-    # One fixed pool serves primary and automatic recovery rounds for this run.
-    # Individual document failures release their future; the pool is not rebuilt.
-    download_executor = ThreadPoolExecutor(
-        max_workers=network.settings.max_workers, thread_name_prefix="pdf-download",
-    )
+    restored_stage2_jobs = _restore_pending_validation_jobs()
     scheduled_filenames: set[str] = set()
-    global_primary_jobs: list[dict[str, Any]] = []
-    global_recovery_backlog = _recovery_candidates(
+    scheduled_document_ids: set[str] = set()
+    primary_jobs_queued = 0
+    primary_failed_results: list[dict[str, Any]] = []
+    queue_completions_seen = 0
+    recovery_backlog = GlobalRecoveryBacklog()
+    restored_recovery_jobs = _recovery_candidates(
         query, max_document_attempts=network.settings.max_document_attempts,
     )
-    global_recovery_not_before = 0.0
-    scheduled_filenames.update(job["filename"] for job in global_recovery_backlog)
+    for job in restored_recovery_jobs:
+        recovery_backlog.add_restored(job)
+    scheduled_filenames.update(job["filename"] for job in restored_recovery_jobs)
+    scheduled_document_ids.update(
+        str(job.get("document_id") or stable_document_id(job))
+        for job in restored_recovery_jobs
+    )
 
     def debug(message: str) -> None:
         debug_events.append(message)
+
+    coordinator = _StreamlitDownloadCoordinator(network, debug)
+
+    def collect_primary_outcomes() -> None:
+        """Keep discovery productive while workers finish in the background."""
+        nonlocal documents_downloaded, queue_completions_seen
+        primary_failed_results.extend(coordinator.drain())
+        new_completions = coordinator.completed - queue_completions_seen
+        if new_completions:
+            documents_downloaded += new_completions
+            queue_completions_seen = coordinator.completed
     # Sibling containers keep the document cards visible when the pipeline closes.
     pipeline_area = st.container()
     downloads_area = st.container()
@@ -1774,13 +2050,15 @@ async def run_scraping_pipeline(
     with pipeline_area:
         with st.status("🤖 Agentic Pipeline Initialized...", expanded=True) as main_status:
             log = main_status.write
-            if global_recovery_backlog:
+            if recovery_backlog:
                 log(
-                    f"♻️ Restored {len(global_recovery_backlog)} interrupted download(s); "
+                    f"♻️ Restored {len(recovery_backlog)} interrupted download(s); "
                     "they are queued for the global recovery round after new primary work."
                 )
             for page_number in range(1, max_pages + 1):
-                if documents_downloaded + len(global_primary_jobs) >= target_documents:
+                collect_primary_outcomes()
+                queued_primary_remaining = max(primary_jobs_queued - coordinator.completed, 0)
+                if documents_downloaded + queued_primary_remaining >= target_documents:
                     debug(
                         f"Target of {target_documents} is satisfied by completed files and the global primary queue; "
                         "stopping new page collection without discarding recovery backlog."
@@ -1851,6 +2129,7 @@ async def run_scraping_pipeline(
                     debug(f"Page {page_number}: mirror-row parsing failed:\n{traceback.format_exc()}")
                 try:
                     search_documents = _extract_search_documents(raw_html, search_url)
+                    parsed_document_count = len(search_documents)
                     log(f"📋 Extraction complete: {len(search_documents)} document record(s), {len(search_rows)} row-level mirror group(s).")
                     debug(f"Page {page_number}: extracted {len(search_documents)} search-result document(s).")
                     debug(
@@ -1874,9 +2153,33 @@ async def run_scraping_pipeline(
                         )
                 except Exception:
                     search_documents = []
+                    parsed_document_count = 0
                     debug(f"Page {page_number}: search-result document parsing failed:\n{traceback.format_exc()}")
 
+                completed_stage1_reader = globals().get("_stage1_completed_document_ids")
+                identity_builder = globals().get("stable_document_id")
+                if callable(completed_stage1_reader) and callable(identity_builder):
+                    known_stage1_ids = completed_stage1_reader()
+                    if known_stage1_ids:
+                        before = len(search_documents)
+                        search_documents = [
+                            document for document in search_documents
+                            if identity_builder({"source_url": document.get("link", "")}) not in known_stage1_ids
+                        ]
+                        if before != len(search_documents):
+                            debug(
+                                f"Page {page_number}: skipped {before - len(search_documents)} document(s) "
+                                "whose Stage 1 lifecycle is already complete."
+                            )
+
                 if not search_documents:
+                    if parsed_document_count:
+                        debug(
+                            f"Page {page_number}: all {parsed_document_count} parsed document(s) already have "
+                            "a terminal Stage 1 lifecycle; continuing discovery."
+                        )
+                        log(f"📋 Page {page_number}: all parsed documents were already evaluated; continuing.")
+                        continue
                     debug(f"Page {page_number}: no document records available for evaluation; stopping collection.")
                     log(f"📋 Page {page_number}: 0 document records — stopping further page collection.")
                     break
@@ -1922,6 +2225,37 @@ async def run_scraping_pipeline(
                         document for document in extracted_documents
                         if document.get("approved") is not False
                     ]
+                    approved_ids = {
+                        int(document["id"]) for document in approved_docs
+                        if isinstance(document.get("id"), int)
+                    }
+                    # Stage 1 rejects are terminal semantic decisions too.  Keep
+                    # them in the same filename-keyed ledger with a stable source
+                    # identity so a later Streamlit run does not call the LLM for
+                    # the exact same Libgen record again.
+                    for document in document_batch:
+                        if document["id"] in approved_ids:
+                            continue
+                        rejected_title = str(document.get("title") or "Untitled document")
+                        rejected_mirrors = _document_mirror_links(document, search_rows, search_url)
+                        rejected_filename = _safe_pdf_filename(rejected_title, page_number, document["id"])
+                        rejected_candidate = {
+                            "filename": rejected_filename,
+                            "source_url": str(document.get("link") or ""),
+                            "mirrors": rejected_mirrors,
+                            "document_id": stable_document_id({
+                                "source_url": str(document.get("link") or ""),
+                                "mirrors": rejected_mirrors,
+                                "title": rejected_title,
+                            }),
+                            "title": rejected_title,
+                            "query": query.strip(),
+                            "stage1_status": "REJECTED",
+                        }
+                        _update_download_state(
+                            rejected_filename, rejected_candidate["source_url"], "STAGE1_REJECTED",
+                            candidate=rejected_candidate, completed=False,
+                        )
                     debug(
                         f"Page {page_number}: evaluator returned {len(extracted_documents)} document(s); "
                         f"{len(approved_docs)} approved for download."
@@ -1949,7 +2283,8 @@ async def run_scraping_pipeline(
                     label=f"✅ AI Approved {len(approved_docs)} documents on page {page_number}.",
                     state="running", expanded=True,
                 )
-                remaining = max(target_documents - documents_downloaded - len(global_primary_jobs), 0)
+                collect_primary_outcomes()
+                remaining = max(target_documents - documents_downloaded - max(primary_jobs_queued - coordinator.completed, 0), 0)
                 already_stored = 0
                 recovery_retained = 0
                 queued_now = 0
@@ -1959,13 +2294,18 @@ async def run_scraping_pipeline(
                     title = str(document.get("title") or "Untitled document")
                     mirror_links = _document_mirror_links(document, search_rows, search_url)
                     filename = _safe_pdf_filename(title, page_number, document["id"])
+                    candidate_identity = stable_document_id({
+                        "source_url": str(document.get("link") or ""),
+                        "mirrors": mirror_links,
+                        "title": title,
+                    })
                     _, destination, _ = _download_paths(filename)
                     if destination.exists():
                         already_stored += 1
                         log(f"  📂 Already stored: {filename}; skipping download.")
-                    elif filename in scheduled_filenames:
+                    elif filename in scheduled_filenames or candidate_identity in scheduled_document_ids:
                         recovery_retained += 1
-                        log(f"  ♻️ Existing recovery state retained for: {filename}; avoiding a duplicate worker assignment.")
+                        log(f"  ♻️ Existing lifecycle state retained for: {filename}; avoiding a duplicate worker assignment.")
                     elif not mirror_links:
                         missing_links += 1
                         failed_urls.append(str(document.get("link") or "missing document link"))
@@ -1978,68 +2318,58 @@ async def run_scraping_pipeline(
                             stage1_score = int(document.get("score", 100) or 100)
                         except (TypeError, ValueError):
                             stage1_score = 100
-                        global_primary_jobs.append({
+                        candidate = {
                             "filename": filename,
                             "mirrors": mirror_links,
                             "source_url": str(document.get("link") or ""),
                             "stage1_score": stage1_score,
-                            "document_id": str(document.get("id") or filename),
+                            "document_id": candidate_identity,
                             "title": title,
                             "query": query.strip(),
-                        })
+                        }
                         scheduled_filenames.add(filename)
+                        scheduled_document_ids.add(candidate_identity)
                         queued_now += 1
+                        primary_jobs_queued += 1
+                        with downloads_area:
+                            await coordinator.enqueue(candidate)
                         log(f"  ⬇️ Queued for download: {filename}")
                 log(
                     f"📊 Page {page_number} summary: queued {queued_now} · already stored {already_stored} · "
                     f"recovery retained {recovery_retained} · missing links {missing_links}"
                 )
 
-            if global_primary_jobs:
+            if primary_jobs_queued:
                 log(
-                    f"⬇️ Global primary queue ready: {len(global_primary_jobs)} approved document(s); "
-                    f"using up to {network.settings.max_workers} workers."
+                    f"⬇️ Global primary queue is draining {primary_jobs_queued} approved document(s) "
+                    f"with up to {network.settings.max_workers} workers."
                 )
-                with downloads_area:
-                    completed_now, failed_primary = await _download_round(
-                        global_primary_jobs, network, debug, executor=download_executor,
-                        round_number=1, recovery=False,
-                    )
-                documents_downloaded += completed_now
-                for result in failed_primary:
-                    attempt = int(result["attempt"])
-                    candidate = dict(result["candidate"])
-                    if attempt < network.settings.max_document_attempts:
-                        candidate["_document_attempt"] = attempt + 1
-                        global_recovery_backlog.append(candidate)
-                        global_recovery_not_before = max(
-                            global_recovery_not_before, float(result.get("retry_after_until", 0) or 0),
-                        )
-                    else:
-                        failed_urls.extend(candidate.get("mirrors", []))
+            if restored_stage2_jobs:
+                log(
+                    f"📄 Restored {restored_stage2_jobs} completed PDF(s) into the bounded Stage 2 queue; "
+                    "no download will be repeated."
+                )
+                primary_failed_results.extend(await coordinator.drain_until_idle())
+                new_completions = coordinator.completed - queue_completions_seen
+                documents_downloaded += new_completions
+                queue_completions_seen = coordinator.completed
+            for result in primary_failed_results:
+                next_job, terminal = recovery_backlog.add_failed_attempt(
+                    result, max_attempts=network.settings.max_document_attempts,
+                )
+                if terminal:
+                    failed_urls.extend(dict(result.get("candidate") or {}).get("mirrors", []))
 
             recovery_round = 1
-            recovered_successfully = 0
-            while global_recovery_backlog:
-                valid_recovery_jobs: list[dict[str, Any]] = []
-                for candidate in global_recovery_backlog:
-                    attempt = int(candidate.get("_document_attempt", 1) or 1)
-                    if 1 <= attempt <= network.settings.max_document_attempts:
-                        valid_recovery_jobs.append(candidate)
-                    else:
-                        _update_download_state(
-                            candidate["filename"], candidate.get("source_url", ""), "PERMANENTLY_FAILED",
-                            size=_download_size(candidate["filename"]),
-                            candidate={key: value for key, value in candidate.items() if not key.startswith("_")},
-                            document_attempt=min(max(attempt, 1), network.settings.max_document_attempts),
-                            completed=False, reason="recovery attempt exceeds configured maximum",
-                        )
-                        failed_urls.extend(candidate.get("mirrors", []))
+            while recovery_backlog:
+                valid_recovery_jobs = recovery_backlog.take_round(
+                    max_attempts=network.settings.max_document_attempts,
+                )
                 if not valid_recovery_jobs:
                     break
                 delay = max(
                     network.settings.recovery_round_delay_seconds,
-                    global_recovery_not_before - time.time(),
+                    recovery_backlog.not_before - time.time(),
                 )
                 if delay:
                     log(
@@ -2051,31 +2381,18 @@ async def run_scraping_pipeline(
                         f"♻️ Global recovery round {recovery_round}: {len(valid_recovery_jobs)} document(s)."
                     )
                 with downloads_area:
-                    completed_now, failed_recovery = await _download_round(
-                        valid_recovery_jobs, network, debug, executor=download_executor,
-                        round_number=recovery_round, recovery=True,
-                    )
-                documents_downloaded += completed_now
-                recovered_successfully += completed_now
-                next_recovery_backlog: list[dict[str, Any]] = []
-                next_recovery_not_before = 0.0
+                    for candidate in valid_recovery_jobs:
+                        await coordinator.enqueue(candidate, recovery=True)
+                failed_recovery = await coordinator.drain_until_idle()
+                new_completions = coordinator.completed - queue_completions_seen
+                documents_downloaded += new_completions
+                queue_completions_seen = coordinator.completed
                 for result in failed_recovery:
-                    attempt = int(result["attempt"])
-                    candidate = dict(result["candidate"])
-                    if attempt >= network.settings.max_document_attempts:
-                        _update_download_state(
-                            candidate["filename"], candidate.get("source_url", ""), "PERMANENTLY_FAILED",
-                            size=_download_size(candidate["filename"]),
-                            candidate={key: value for key, value in candidate.items() if not key.startswith("_")},
-                            document_attempt=attempt, completed=False,
-                        )
-                        failed_urls.extend(candidate.get("mirrors", []))
-                        continue
-                    candidate["_document_attempt"] = attempt + 1
-                    next_recovery_backlog.append(candidate)
-                    next_recovery_not_before = max(next_recovery_not_before, float(result.get("retry_after_until", 0) or 0))
-                global_recovery_backlog = next_recovery_backlog
-                global_recovery_not_before = next_recovery_not_before
+                    next_job, terminal = recovery_backlog.add_failed_attempt(
+                        result, max_attempts=network.settings.max_document_attempts,
+                    )
+                    if terminal:
+                        failed_urls.extend(dict(result.get("candidate") or {}).get("mirrors", []))
                 recovery_round += 1
 
             if pages_processed or documents_downloaded >= target_documents:
@@ -2112,7 +2429,7 @@ async def run_scraping_pipeline(
             st.write("Document download outcomes:")
             st.code("\n\n".join(download_events))
 
-    download_executor.shutdown(wait=True)
+    coordinator.close()
     network.close()
     stage2_totals = validation_summary(DATA_DIRECTORY)
     return {

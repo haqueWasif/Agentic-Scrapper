@@ -43,11 +43,12 @@ def lifecycle_view(entry: dict[str, Any], *, status: str, candidate: dict[str, A
     previous_download = previous.get("download") if isinstance(previous.get("download"), dict) else {}
     previous_stage2 = previous.get("stage2") if isinstance(previous.get("stage2"), dict) else {}
     normalized = status.upper()
-    stage1_status = previous_stage1.get("status") or ("APPROVED" if candidate else "PENDING")
+    stage1_status = candidate.get("stage1_status") or previous_stage1.get("status") or ("APPROVED" if candidate else "PENDING")
     stage2_status = validation_status or entry.get("validation_status") or previous_stage2.get("status") or "PENDING"
     final_status = (
         "ACCEPTED" if stage2_status == "APPROVED" else
         "REJECTED" if stage2_status == "REJECTED" else
+        "STAGE1_REJECTED" if stage1_status == "REJECTED" else
         "DOWNLOAD_FAILED" if normalized == "PERMANENTLY_FAILED" else
         "IN_PROGRESS"
     )

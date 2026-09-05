@@ -21,3 +21,6 @@ pipeline:
   stage1_queue_maxsize: 100
   download_queue_maxsize: 50
   stage2_queue_maxsize: 20
+
+validation:
+  max_workers: 2
