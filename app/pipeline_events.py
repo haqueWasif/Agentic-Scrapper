@@ -53,11 +53,18 @@ class DownloadPresentation:
     debug_limit: int = 500
     workers: dict[int, dict[str, Any]] = field(default_factory=dict)
     activity: deque[str] = field(init=False)
+    activity_times: deque[float] = field(init=False)
     debug: deque[str] = field(init=False)
 
     def __post_init__(self) -> None:
         self.activity = deque(maxlen=max(1, self.activity_limit))
+        self.activity_times = deque(maxlen=max(1, self.activity_limit))
         self.debug = deque(maxlen=max(1, self.debug_limit))
+
+    def add_activity(self, message: str, *, timestamp: float | None = None) -> None:
+        """Record one bounded, user-facing lifecycle line with its event time."""
+        self.activity.append(str(message))
+        self.activity_times.append(float(timestamp if timestamp is not None else time.time()))
 
     @staticmethod
     def _short(event: dict[str, Any]) -> str:
@@ -75,13 +82,13 @@ class DownloadPresentation:
         if detail and level in {"DEBUG", "TRACE"}:
             self.debug.append(detail[:2000])
         if level in {"STATUS", "LIFECYCLE"} and short:
-            self.activity.append(short)
+            self.add_activity(short, timestamp=float(event.get("timestamp", time.time()) or time.time()))
         if worker_id < 1:
             return
         row = self.workers.setdefault(worker_id, {"worker": worker_id, "state": "IDLE"})
         for key in (
             "filename", "document_id", "source_page", "source_item", "work_kind", "document_attempt",
-            "max_attempts", "gateway_host", "bytes_downloaded", "total_bytes", "state", "short_message",
+            "max_attempts", "gateway_host", "bytes_downloaded", "total_bytes", "state", "short_message", "document_title",
         ):
             if key in event and event[key] is not None:
                 row[key] = event[key]
@@ -90,10 +97,23 @@ class DownloadPresentation:
             row["bytes_downloaded"] = int(event.get("downloaded", event.get("bytes_downloaded", 0)) or 0)
             row["total_bytes"] = int(event.get("total", event.get("total_bytes", 0)) or 0)
             row["state"] = event.get("state") or "MAKING_PROGRESS"
+            row["last_progress_at"] = float(event.get("timestamp", time.time()) or time.time())
         elif kind == "success":
             row["state"] = "COMPLETED"
         elif kind == "failure":
             row["state"] = event.get("state") or "FAILED_FOR_ROUND"
+        elif str(row.get("state") or "") in {"DOWNLOADING", "MAKING_PROGRESS"}:
+            row.setdefault("last_progress_at", float(event.get("timestamp", time.time()) or time.time()))
+
+    def mark_stalled(self, seconds: float) -> None:
+        """Mark an inactive transfer row without changing the worker's execution."""
+        now = time.time()
+        for row in self.workers.values():
+            if str(row.get("state") or "") not in {"DOWNLOADING", "MAKING_PROGRESS"}:
+                continue
+            if now - float(row.get("last_progress_at", now) or now) >= max(1.0, seconds):
+                row["state"] = "STALLED"
+                row["last_event"] = "No byte progress within the configured stall window"
 
     def worker_rows(self) -> list[dict[str, Any]]:
         return [self.workers.get(index, {"worker": index, "state": "IDLE"}) for index in range(1, self.max_workers + 1)]
@@ -242,4 +262,105 @@ class RunMetrics:
             f"Stage 2 queued {self.stage2_queued}, active {self.stage2_running}/{validation_workers}, ✓ {self.stage2_approved} / "
             f"✕ {self.stage2_rejected}, pending {self.stage2_pending}, invalid {self.stage2_invalid} · final accepted {self.stage2_approved} · "
             f"duplicates {self.duplicates}"
+        )
+
+    def stage2_rows(self) -> list[tuple[str, str]]:
+        """Expose the bounded active/pending validation names for presentation only."""
+        return list(self._stage2_inflight.items())
+
+
+@dataclass(frozen=True)
+class PipelineDashboardSnapshot:
+    """One presentation-only, internally consistent view of the live pipeline.
+
+    Queue and recovery fields deliberately come from their owning schedulers;
+    lifecycle totals remain event-derived.  This object never schedules work or
+    mutates durable state.
+    """
+
+    discovery_page: int
+    max_pages: int
+    target_documents: int
+    discovered: int
+    stage1_approved: int
+    stage1_rejected: int
+    downloaded: int
+    queue_active: int
+    queue_pending: int
+    worker_rows: tuple[dict[str, Any], ...]
+    recovery_backlog: int
+    recovery_queued: int
+    recovery_active: int
+    recovery_near_limit: int
+    permanently_failed: int
+    stage2_active: int
+    stage2_queued: int
+    stage2_approved: int
+    stage2_rejected: int
+    stage2_pending: int
+    stage2_invalid: int
+
+    @staticmethod
+    def empty_debug_message() -> str:
+        return "No network debug events yet."
+
+    @classmethod
+    def from_sources(
+        cls,
+        *,
+        metrics: RunMetrics,
+        presentation: DownloadPresentation,
+        queue_active: int,
+        queue_pending: int,
+        recovery_jobs: list[dict[str, Any]],
+        discovery_page: int,
+        max_pages: int,
+        target_documents: int,
+        max_document_attempts: int,
+    ) -> "PipelineDashboardSnapshot":
+        rows = [dict(row) for row in presentation.worker_rows()]
+        active_states = {"DOWNLOADING", "MAKING_PROGRESS", "STALLED", "RETRYING", "SWITCHING_ROUTE", "STARTING"}
+        active_indices = [
+            index for index, row in enumerate(rows)
+            if str(row.get("state") or "").upper() in active_states
+        ]
+        # The queue is the authoritative owner of active work. A just-finished
+        # worker can otherwise retain an old progress event for one UI drain.
+        for index in active_indices[max(0, int(queue_active)):]:
+            rows[index].update({"state": "IDLE", "work_kind": None, "last_event": "Worker idle"})
+        represented_active = min(len(active_indices), max(0, int(queue_active)))
+        # A queue worker becomes active immediately before its first telemetry
+        # event. Surface that narrow window rather than contradicting the queue.
+        for row in rows:
+            if represented_active >= max(0, int(queue_active)):
+                break
+            if str(row.get("state") or "IDLE").upper() == "IDLE":
+                row.update({
+                    "state": "STARTING", "work_kind": "Telemetry", "last_event": "Worker active; awaiting first telemetry event",
+                })
+                represented_active += 1
+
+        recovery_active = sum(
+            1 for row in rows
+            if str(row.get("work_kind") or "").lower() == "recovery"
+            and str(row.get("state") or "").upper() in active_states
+        )
+        recovery_backlog = len(recovery_jobs)
+        recovery_queued = max(0, recovery_backlog - recovery_active)
+        near_limit = sum(
+            1 for job in recovery_jobs
+            if int(job.get("_document_attempt", 1) or 1) >= max(1, int(max_document_attempts) - 1)
+        )
+        return cls(
+            discovery_page=max(1, int(discovery_page)), max_pages=max(1, int(max_pages)),
+            target_documents=max(0, int(target_documents)), discovered=metrics.discovered,
+            stage1_approved=metrics.stage1_approved, stage1_rejected=metrics.stage1_rejected,
+            downloaded=metrics.total_downloaded, queue_active=max(0, int(queue_active)),
+            queue_pending=max(0, int(queue_pending)), worker_rows=tuple(rows),
+            recovery_backlog=recovery_backlog, recovery_queued=recovery_queued,
+            recovery_active=recovery_active, recovery_near_limit=near_limit,
+            permanently_failed=metrics.permanently_failed, stage2_active=metrics.stage2_running,
+            stage2_queued=metrics.stage2_queued, stage2_approved=metrics.stage2_approved,
+            stage2_rejected=metrics.stage2_rejected, stage2_pending=metrics.stage2_pending,
+            stage2_invalid=metrics.stage2_invalid,
         )

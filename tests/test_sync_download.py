@@ -174,6 +174,44 @@ class SyncDownloadTests(unittest.TestCase):
                 streamed = [url for url, args in self.calls if args.get('stream')]
                 self.assertEqual(streamed[-1], 'https://mirror.example/good.pdf')
 
+    def test_top_level_mirrors_share_one_document_attempt_route_context(self):
+        """The same GET route must not be retried through a second parent page."""
+        route_a = 'https://cdn.example/get.php?md5=abc&key=one'
+        route_b = 'https://cdn.example/get.php?key=one&md5=abc'
+        self.responses = [
+            Response(text=f'<a href="{route_a}">GET</a>'),
+            Response(status=403),
+            Response(text=f'<a href="{route_b}">GET</a>'),
+        ]
+        context = {"visited_pages": set(), "attempted_download_routes": set(), "failed_routes": set()}
+        self.assertEqual(
+            self.ns['parse_mirror_and_download'](
+                'https://mirror-a.example/book/1', 'test.pdf', needs_page_check=False,
+                _attempt_context=context,
+            ),
+            False,
+        )
+        self.assertEqual(
+            self.ns['parse_mirror_and_download'](
+                'https://mirror-b.example/book/1', 'test.pdf', needs_page_check=False,
+                _attempt_context=context,
+            ),
+            'retry_next',
+        )
+        streamed = [url for url, options in self.calls if options.get('stream')]
+        self.assertEqual(streamed, [route_a])
+
+        # Recovery obtains a new document-attempt context, so this route remains
+        # eligible under the existing recovery policy.
+        self.responses = [Response(text=f'<a href="{route_b}">GET</a>'), Response(status=403)]
+        next_context = {"visited_pages": set(), "attempted_download_routes": set(), "failed_routes": set()}
+        self.ns['parse_mirror_and_download'](
+            'https://mirror-b.example/book/1', 'test.pdf', needs_page_check=False,
+            _attempt_context=next_context,
+        )
+        streamed = [url for url, options in self.calls if options.get('stream')]
+        self.assertEqual(streamed[-1], route_b)
+
     def test_two_server_errors_mark_gateway_unhealthy_then_try_next_gateway(self):
         self.responses = [Response(text='<a href="/bad.pdf">GET</a><a href="/good.pdf">DOWNLOAD</a>'), Response(status=500), Response(status=500), Response()]
         self.assertTrue(self.download())
@@ -230,6 +268,18 @@ class SyncDownloadTests(unittest.TestCase):
         self.assertEqual(self.calls[1][0], self.calls[2][0])
         self.assertEqual(self.calls[2][1]['headers']['Range'], 'bytes=3000-')
         self.assertEqual(self.destination.read_bytes(), PDF)
+
+    def test_permanent_route_failure_preserves_existing_partial_for_recovery(self):
+        partial = PDF[:3000]
+        self.seed_part(partial)
+        self.responses = [Response(status=403)]
+        self.assertEqual(
+            self.ns['download_file']('https://cdn.example/file', 'test.pdf', 'https://mirror.example'),
+            'retry_next',
+        )
+        self.assertTrue(self.part.exists())
+        self.assertEqual(self.part.read_bytes(), partial)
+        self.assertEqual(self.calls[0][1]['headers']['Range'], 'bytes=3000-')
 
     def test_ignored_range_restarts_instead_of_appending(self):
         self.seed_part(PDF[:3000])
