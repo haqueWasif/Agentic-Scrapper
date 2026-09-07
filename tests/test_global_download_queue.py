@@ -76,6 +76,29 @@ class GlobalDownloadQueueTests(unittest.TestCase):
         self.assertTrue(queue.idle)
         self.assertLessEqual(maximum, 3)
 
+    def test_cancelled_close_discards_jobs_that_never_started(self):
+        started = threading.Event()
+        release = threading.Event()
+        completed = []
+
+        def worker(candidate, worker_id):
+            started.set()
+            release.wait(1)
+            completed.append(candidate["filename"])
+            return {"success": True, "candidate": candidate}
+
+        queue = GlobalDownloadQueue(worker, max_workers=1, maxsize=4)
+        self.assertTrue(queue.try_enqueue({"filename": "active.pdf"}))
+        self.assertTrue(started.wait(1))
+        self.assertTrue(queue.try_enqueue({"filename": "never-started-1.pdf"}))
+        self.assertTrue(queue.try_enqueue({"filename": "never-started-2.pdf"}))
+        queue.close(cancel_pending=True, wait=False)
+        release.set()
+        deadline = time.monotonic() + 1
+        while len(completed) < 1 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(completed, ["active.pdf"])
+
     def test_bounded_stage2_handoff_never_executes_more_than_its_worker_limit(self):
         active = maximum = 0
         lock = threading.Lock()

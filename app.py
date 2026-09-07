@@ -516,13 +516,43 @@ def _completed_download_count() -> int:
     """Count durable finished PDFs once, including files created before the ledger existed."""
     if not DOWNLOAD_DIRECTORY.exists():
         return 0
-    completed = 0
-    for path in DOWNLOAD_DIRECTORY.glob("*.pdf"):
-        entry = _download_state_entry(path.name)
-        if not entry or str(entry.get("status", "")).upper() != "COMPLETED":
-            _update_download_state(path.name, "", "COMPLETED", size=path.stat().st_size, completed=True)
-        completed += 1
-    return completed
+    paths = list(DOWNLOAD_DIRECTORY.glob("*.pdf"))
+    # Read and (when necessary) persist the ledger once.  Calling
+    # ``_download_state_entry`` for every file repeatedly parsed the multi-MB
+    # downloads.json file and dominated Streamlit's initial render time.
+    with _DOWNLOAD_STATE_LOCK:
+        with _download_state_process_lock() as acquired:
+            if not acquired:
+                return len(paths)
+            state = _load_download_state()
+            downloads = state["downloads"]
+            changed = False
+            now = int(time.time())
+            for path in paths:
+                entry = downloads.get(path.name)
+                if isinstance(entry, dict) and str(entry.get("status", "")).upper() == "COMPLETED":
+                    continue
+                size = path.stat().st_size
+                entry = dict(entry) if isinstance(entry, dict) else {}
+                entry.update({
+                    "filename": path.name,
+                    "url": str(entry.get("url") or ""),
+                    "status": "COMPLETED",
+                    "size": size,
+                    "bytes_downloaded": size,
+                    "completed": True,
+                    "updated_at": now,
+                })
+                candidate = entry.get("candidate") if isinstance(entry.get("candidate"), dict) else {}
+                entry["lifecycle"] = lifecycle_view(
+                    entry, status="COMPLETED", candidate=candidate,
+                    validation_status=entry.get("validation_status"),
+                )
+                downloads[path.name] = entry
+                changed = True
+            if changed:
+                _save_download_state(state)
+    return len(paths)
 
 
 def _stage1_completed_document_ids() -> set[str]:
@@ -1526,6 +1556,15 @@ def _validation_queue() -> BoundedWorkQueue:
         return _VALIDATION_QUEUE
 
 
+def _stop_validation_queue(*, cancel_pending: bool = False, wait: bool = True) -> None:
+    """Release Stage 2 workers when a Streamlit run/server is cancelled."""
+    global _VALIDATION_QUEUE
+    with _VALIDATION_QUEUE_LOCK:
+        queue, _VALIDATION_QUEUE = _VALIDATION_QUEUE, None
+    if queue is not None:
+        queue.close(cancel_pending=cancel_pending, wait=wait)
+
+
 def _schedule_validation(filename: str, *, stage1_score: int | None = 100) -> bool:
     """Release a completed PDF into the bounded Stage 2 queue, never blocking download workers."""
     _, destination, _ = _download_paths(filename)
@@ -1650,17 +1689,42 @@ async def _download_bulk_cards(candidates: list[dict[str, Any]], debug) -> int:
     return completed
 
 
-def _recovery_candidates(query: str, *, max_document_attempts: int = 5) -> list[dict[str, Any]]:
+def _recovery_candidates(
+    query: str, *, max_document_attempts: int = 5, limit: int | None = None,
+) -> list[dict[str, Any]]:
     """Rebuild interrupted approved jobs without repeating search or Stage 1."""
     normalized_query = query.strip().lower()
     recovered: list[dict[str, Any]] = []
+    if limit is not None and limit <= 0:
+        return recovered
     with _DOWNLOAD_STATE_LOCK:
         with _download_state_process_lock() as acquired:
             if not acquired:
                 return recovered
             state = _load_download_state()
             changed = False
-            for filename, entry in state["downloads"].items():
+            entries = list(state["downloads"].items())
+            # Resume real partial transfers first.  Records with no downloaded
+            # bytes remain durable and eligible for a later run, but they must
+            # not crowd out useful .part files when this run needs only a small
+            # number of additional documents.
+            def recovery_priority(item: tuple[str, Any]) -> tuple[int, int, int]:
+                filename, entry = item
+                if not isinstance(entry, dict):
+                    return (2, 0, 0)
+                _, _, part_path = _download_paths(filename)
+                try:
+                    part_size = part_path.stat().st_size
+                except OSError:
+                    part_size = 0
+                return (
+                    0 if part_size > 0 else 1,
+                    -part_size,
+                    -int(entry.get("updated_at", 0) or 0),
+                )
+
+            entries.sort(key=recovery_priority)
+            for filename, entry in entries:
                 if not isinstance(entry, dict):
                     continue
                 status = str(entry.get("status", "")).upper()
@@ -1703,6 +1767,8 @@ def _recovery_candidates(query: str, *, max_document_attempts: int = 5) -> list[
                     next_attempt = previous_attempt + 1
                 else:  # QUEUED or RECOVERING: no completed attempt to consume.
                     next_attempt = previous_attempt
+                if limit is not None and len(recovered) >= limit:
+                    continue
                 job = dict(candidate)
                 job["filename"] = filename
                 job["_document_attempt"] = next_attempt
@@ -2111,9 +2177,19 @@ class _StreamlitDownloadCoordinator:
         failures.extend(self.drain())
         return failures
 
-    def close(self) -> None:
+    def close(self, *, cancel_pending: bool = False, wait: bool = True) -> None:
         self.drain()
-        self.queue.close()
+        self.queue.close(cancel_pending=cancel_pending, wait=wait)
+
+    def __del__(self) -> None:
+        # Streamlit cancels the script coroutine on rerun/server shutdown.
+        # If that happens before the normal close at the end of the pipeline,
+        # discard only not-yet-started in-memory jobs so executor threads do not
+        # keep the Python process alive processing a stale queue after Ctrl+C.
+        try:
+            self.queue.close(cancel_pending=True, wait=False)
+        except Exception:
+            pass
 
 
 class _DashboardStatusSink:
@@ -2266,7 +2342,9 @@ async def run_scraping_pipeline(
     queue_completions_seen = 0
     recovery_backlog = GlobalRecoveryBacklog()
     restored_recovery_jobs = _recovery_candidates(
-        query, max_document_attempts=network.settings.max_document_attempts,
+        query,
+        max_document_attempts=network.settings.max_document_attempts,
+        limit=max(0, target_documents - documents_downloaded),
     )
     for job in restored_recovery_jobs:
         job.setdefault("run_id", run_id)
@@ -2409,9 +2487,18 @@ async def run_scraping_pipeline(
             activity_rows.append(f"{time.strftime('%H:%M:%S', time.localtime(timestamp))}  {message}")
         activity_placeholder.markdown("  \n".join(activity_rows) or "No lifecycle activity yet.")
 
+        # The recovery backlog can contain hundreds of durable records.  Read
+        # downloads.json once per dashboard refresh instead of once per row,
+        # and bound the collapsed table so UI rendering cannot starve the
+        # Streamlit event loop.  The scheduler still retains every job.
+        with _DOWNLOAD_STATE_LOCK:
+            recovery_state = dict(_load_download_state().get("downloads", {}))
         recovery_rows = []
-        for candidate in coordinator.recovery_jobs.values():
-            entry = _download_state_entry(str(candidate.get("filename") or "")) or {}
+        visible_recovery_jobs = list(coordinator.recovery_jobs.values())[:50]
+        for candidate in visible_recovery_jobs:
+            filename = str(candidate.get("filename") or "")
+            entry = recovery_state.get(filename)
+            entry = entry if isinstance(entry, dict) else {}
             partial_mb = float(entry.get("size", _download_size(str(candidate.get("filename") or ""))) or 0) / (1024 * 1024)
             recovery_rows.append({
                 "Document": human_document_name(candidate),
@@ -2419,6 +2506,12 @@ async def run_scraping_pipeline(
                 "Attempt": f"{candidate.get('_document_attempt', 1)}/{network.settings.max_document_attempts}",
                 "Partial MB": f"{partial_mb:.2f}", "Last failure": str(entry.get("last_error") or "Waiting")[:140],
                 "State": str(entry.get("status") or "RECOVERY_WAIT"),
+            })
+        if len(coordinator.recovery_jobs) > len(visible_recovery_jobs):
+            recovery_rows.append({
+                "Document": f"… {len(coordinator.recovery_jobs) - len(visible_recovery_jobs)} more queued records",
+                "Source": "—", "Attempt": "—", "Partial MB": "—",
+                "Last failure": "Full count remains visible in Pipeline overview", "State": "QUEUED",
             })
         render_table(recovery_placeholder, recovery_rows, "No documents in the recovery backlog.")
 
@@ -2459,6 +2552,22 @@ async def run_scraping_pipeline(
     )
     coordinator.dashboard_renderer = render_dashboard
     coordinator.set_recovery_backlog(restored_recovery_jobs)
+    pipeline_task = asyncio.current_task()
+    if pipeline_task is not None:
+        def release_workers_after_aborted_run(task) -> None:
+            """Do not drain queued work after a cancelled/failed script run."""
+            aborted = task.cancelled()
+            if not aborted:
+                try:
+                    aborted = task.exception() is not None
+                except (asyncio.CancelledError, RuntimeError):
+                    aborted = True
+            if aborted:
+                coordinator.queue.close(cancel_pending=True, wait=False)
+                _stop_validation_queue(cancel_pending=True, wait=False)
+                network.close()
+
+        pipeline_task.add_done_callback(release_workers_after_aborted_run)
 
     def collect_primary_outcomes() -> None:
         """Keep discovery productive while workers finish in the background."""

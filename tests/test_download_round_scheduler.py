@@ -249,6 +249,52 @@ class PersistentRecoveryStateTests(unittest.TestCase):
             self.assertEqual(namespace["_recovery_candidates"]("ASHRAE", max_document_attempts=5), [])
             self.assertEqual(namespace["_load_download_state"]()["downloads"]["A.pdf"]["status"], "PERMANENTLY_FAILED")
 
+    def test_recovery_limit_prioritizes_existing_partial_bytes(self):
+        source = (Path(__file__).resolve().parents[1] / "app.py").read_text(encoding="utf-8")
+        wanted = {"_download_paths", "_load_download_state", "_save_download_state", "_download_state_process_lock", "_recovery_candidates"}
+        nodes = [node for node in ast.parse(source).body if isinstance(node, ast.FunctionDef) and node.name in wanted]
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            namespace = {
+                "Any": Any, "Path": Path, "json": json, "os": __import__("os"), "time": time,
+                "threading": threading, "tempfile": __import__("tempfile"), "contextmanager": contextmanager,
+                "logging": __import__("logging"), "DOWNLOAD_DIRECTORY": root / "ASHRAE_Files",
+                "DOWNLOAD_STATE_FILE": root / "downloads.json", "_DOWNLOAD_STATE_LOCK": threading.Lock(),
+            }
+            exec(compile(ast.Module(body=nodes, type_ignores=[]), "app.py", "exec"), namespace)
+            _, _, partial_path = namespace["_download_paths"]("partial.pdf")
+            partial_path.write_bytes(b"resume me")
+            candidate = lambda name: {"filename": name, "mirrors": [f"https://example.test/{name}"], "query": "ASHRAE"}
+            namespace["_save_download_state"]({"downloads": {
+                "empty-1.pdf": {"status": "QUEUED", "document_attempt": 1, "candidate": candidate("empty-1.pdf"), "query": "ASHRAE"},
+                "partial.pdf": {"status": "FAILED_FOR_ROUND", "document_attempt": 1, "candidate": candidate("partial.pdf"), "query": "ASHRAE"},
+                "empty-2.pdf": {"status": "QUEUED", "document_attempt": 1, "candidate": candidate("empty-2.pdf"), "query": "ASHRAE"},
+            }})
+            jobs = namespace["_recovery_candidates"]("ASHRAE", limit=1)
+            self.assertEqual([job["filename"] for job in jobs], ["partial.pdf"])
+            self.assertEqual(partial_path.read_bytes(), b"resume me")
+
+    def test_zero_recovery_limit_does_not_requeue_target_excess(self):
+        source = (Path(__file__).resolve().parents[1] / "app.py").read_text(encoding="utf-8")
+        wanted = {"_download_paths", "_load_download_state", "_save_download_state", "_download_state_process_lock", "_recovery_candidates"}
+        nodes = [node for node in ast.parse(source).body if isinstance(node, ast.FunctionDef) and node.name in wanted]
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            namespace = {
+                "Any": Any, "Path": Path, "json": json, "os": __import__("os"), "time": time,
+                "threading": threading, "tempfile": __import__("tempfile"), "contextmanager": contextmanager,
+                "logging": __import__("logging"), "DOWNLOAD_DIRECTORY": root / "ASHRAE_Files",
+                "DOWNLOAD_STATE_FILE": root / "downloads.json", "_DOWNLOAD_STATE_LOCK": threading.Lock(),
+            }
+            exec(compile(ast.Module(body=nodes, type_ignores=[]), "app.py", "exec"), namespace)
+            namespace["_save_download_state"]({"downloads": {"A.pdf": {
+                "status": "QUEUED", "document_attempt": 1,
+                "candidate": {"filename": "A.pdf", "mirrors": ["https://example.test/A"], "query": "ASHRAE"},
+                "query": "ASHRAE",
+            }}})
+            self.assertEqual(namespace["_recovery_candidates"]("ASHRAE", limit=0), [])
+            self.assertEqual(namespace["_load_download_state"]()["downloads"]["A.pdf"]["status"], "QUEUED")
+
 
 class DownloadWorkerHandoffTests(unittest.TestCase):
     def test_successful_transfer_marks_completed_and_enqueues_stage2_once(self):

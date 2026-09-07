@@ -18,6 +18,32 @@ from app.pdf_validation import (
 
 
 class PdfValidationStorageTests(unittest.TestCase):
+    def test_scan_reads_each_validation_report_only_once(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            data_directory = Path(temporary_directory) / "data"
+            data_directory.mkdir()
+            for index in range(8):
+                (data_directory / f"document-{index}.pdf").write_bytes(b"%PDF-1.7 placeholder")
+            reports = data_directory / "validation_reports"
+            reports.mkdir()
+            for index in range(6):
+                (reports / f"report-{index}.json").write_text(
+                    '{"stage2_completed": false}', encoding="utf-8",
+                )
+
+            original_read_text = Path.read_text
+            report_reads = 0
+
+            def counted_read_text(path, *args, **kwargs):
+                nonlocal report_reads
+                if path.parent == reports:
+                    report_reads += 1
+                return original_read_text(path, *args, **kwargs)
+
+            with patch.object(Path, "read_text", counted_read_text):
+                self.assertEqual(len(scan_existing_pdfs(data_directory)), 8)
+            self.assertEqual(report_reads, 6)
+
     def test_existing_pdf_is_scanned_once_then_reported_and_stored(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             data_directory = Path(temporary_directory) / "data"

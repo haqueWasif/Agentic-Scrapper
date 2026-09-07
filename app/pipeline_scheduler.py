@@ -66,15 +66,28 @@ class GlobalDownloadQueue:
             except Empty:
                 return drained
 
-    def close(self) -> None:
+    def close(self, *, cancel_pending: bool = False, wait: bool = True) -> None:
         if self._closed:
             return
         self._closed = True
+        if cancel_pending:
+            # Ctrl+C or a Streamlit script cancellation must not leave the
+            # interpreter draining dozens of queued network jobs.  Active
+            # requests retain their normal bounded timeout; jobs that have not
+            # started are returned to durable downloads.json on the next run.
+            while True:
+                try:
+                    queued = self._jobs.get_nowait()
+                except Empty:
+                    break
+                else:
+                    self._jobs.task_done()
         for _ in self._futures:
             self._jobs.put(self._STOP)
-        for future in self._futures:
-            future.result()
-        self._executor.shutdown(wait=True)
+        if wait:
+            for future in self._futures:
+                future.result()
+        self._executor.shutdown(wait=wait, cancel_futures=cancel_pending)
 
     def _consume(self, worker_id: int) -> None:
         while True:
@@ -142,15 +155,28 @@ class BoundedWorkQueue:
     def pending(self) -> int:
         return self._jobs.qsize()
 
-    def close(self) -> None:
+    def close(self, *, cancel_pending: bool = False, wait: bool = True) -> None:
         if self._closed:
             return
         self._closed = True
+        if cancel_pending:
+            while True:
+                try:
+                    queued = self._jobs.get_nowait()
+                except Empty:
+                    break
+                else:
+                    key = str(queued.get("_queue_key", "")) if isinstance(queued, dict) else ""
+                    if key:
+                        with self._known_lock:
+                            self._known.discard(key)
+                    self._jobs.task_done()
         for _ in self._futures:
             self._jobs.put(self._STOP)
-        for future in self._futures:
-            future.result()
-        self._executor.shutdown(wait=True)
+        if wait:
+            for future in self._futures:
+                future.result()
+        self._executor.shutdown(wait=wait, cancel_futures=cancel_pending)
 
     def _consume(self, worker_id: int) -> None:
         while True:

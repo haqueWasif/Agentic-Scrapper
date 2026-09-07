@@ -115,11 +115,35 @@ def scan_existing_pdfs(data_directory: Path, *, revalidate: bool = False) -> lis
     """List unmanaged PDFs under data/, excluding Stage 2 destination folders."""
     directories = validation_directories(data_directory)
     excluded = {directory.resolve() for name, directory in directories.items() if name != "reports"}
+    # Build the completed-report index once.  The old implementation called
+    # ``completed_validation_report`` for every PDF, and that helper scanned
+    # every report each time (PDFs x reports).  With a large local library this
+    # made an otherwise idle Streamlit rerun appear stuck at "Loading".
+    completed_paths: set[Path] = set()
+    completed_report_keys: set[str] = set()
+    if not revalidate:
+        for report_path in directories["reports"].glob("*.json"):
+            try:
+                report = json.loads(report_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(report, dict) or report.get("stage2_completed") is not True:
+                continue
+            completed_report_keys.add(report_path.stem)
+            for key in ("filepath", "stored_path"):
+                value = report.get(key)
+                if value:
+                    try:
+                        completed_paths.add(Path(str(value)).resolve())
+                    except OSError:
+                        pass
     results: list[dict[str, Any]] = []
     for file_path in data_directory.rglob("*.pdf"):
         if not file_path.is_file() or (not revalidate and any(parent.resolve() in excluded for parent in file_path.parents)):
             continue
-        if not revalidate and completed_validation_report(file_path, data_directory):
+        if not revalidate and (
+            file_path.resolve() in completed_paths or _report_key(file_path) in completed_report_keys
+        ):
             continue
         stat = file_path.stat()
         results.append({
