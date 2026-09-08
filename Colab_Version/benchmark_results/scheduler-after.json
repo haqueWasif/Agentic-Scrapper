@@ -1,0 +1,220 @@
+{
+  "wall_seconds": 5.678842299999815,
+  "successful_mib": 30.748313903808594,
+  "aggregate_mib_s": 5.414539140100721,
+  "useful_worker_ratio": 0.9020837175004979,
+  "peak_active_writers": 5,
+  "worker_percent": {
+    "RECEIVING_BYTES": 7.800246175488261,
+    "RESOLVING": 0.0,
+    "CONNECTING": 9.403903639912697,
+    "STALL": 0.0,
+    "RETRY_WAIT": 0.0,
+    "ADMISSION_WAIT": 0.0,
+    "LEDGER_IO": 1.8674169157560796,
+    "DRIVE_SYNC": 0.0,
+    "IDLE": 80.92843326884297,
+    "SCHEDULER_SLEEP": 0.0
+  },
+  "queue_max": {
+    "primary": 7,
+    "handoff": 1,
+    "recovery": 3
+  },
+  "queue_totals": {
+    "enqueued": 10,
+    "admitted": 16,
+    "recoveries": 3,
+    "rate_limit_defers": 2,
+    "handoffs": 1
+  },
+  "scheduling": {
+    "recovery": 3,
+    "primary": 2,
+    "rate_limit_defer": 1,
+    "route_defer": 1,
+    "handoff": 1
+  },
+  "completed": {
+    "healthy-D": 0.6909427999999025,
+    "healthy-E": 0.7145022999975481,
+    "range": 0.9519615999997768,
+    "deferred": 1.010686599998735,
+    "limited": 2.2475625999977638,
+    "resume": 2.374623199997586,
+    "slow": 2.3755681999973604,
+    "document-A": 5.512999899998249,
+    "document-B": 5.513860299997759,
+    "document-C": 5.544474700000137
+  },
+  "attempts": [
+    {
+      "document": "document-A",
+      "attempt": 1,
+      "handoff": 0
+    },
+    {
+      "document": "document-B",
+      "attempt": 1,
+      "handoff": 0
+    },
+    {
+      "document": "document-C",
+      "attempt": 1,
+      "handoff": 0
+    },
+    {
+      "document": "healthy-D",
+      "attempt": 1,
+      "handoff": 0
+    },
+    {
+      "document": "healthy-E",
+      "attempt": 1,
+      "handoff": 0
+    },
+    {
+      "document": "resume",
+      "attempt": 1,
+      "handoff": 0
+    },
+    {
+      "document": "range",
+      "attempt": 1,
+      "handoff": 0
+    },
+    {
+      "document": "deferred",
+      "attempt": 1,
+      "handoff": 0
+    },
+    {
+      "document": "limited",
+      "attempt": 1,
+      "handoff": 0
+    },
+    {
+      "document": "slow",
+      "attempt": 1,
+      "handoff": 0
+    },
+    {
+      "document": "limited",
+      "attempt": 1,
+      "handoff": 0
+    },
+    {
+      "document": "slow",
+      "attempt": 1,
+      "handoff": 0
+    },
+    {
+      "document": "resume",
+      "attempt": 1,
+      "handoff": 1
+    },
+    {
+      "document": "document-A",
+      "attempt": 2,
+      "handoff": 0
+    },
+    {
+      "document": "document-B",
+      "attempt": 2,
+      "handoff": 0
+    },
+    {
+      "document": "document-C",
+      "attempt": 2,
+      "handoff": 0
+    }
+  ],
+  "requests": [
+    {
+      "name": "document-A",
+      "range": null,
+      "time": 0.1428602999985742
+    },
+    {
+      "name": "document-B",
+      "range": null,
+      "time": 0.16354589999900782
+    },
+    {
+      "name": "document-C",
+      "range": null,
+      "time": 0.18256909999763593
+    },
+    {
+      "name": "mirror-E",
+      "range": null,
+      "time": 0.2943812999983493
+    },
+    {
+      "name": "healthy-D",
+      "range": null,
+      "time": 0.4142780000001949
+    },
+    {
+      "name": "healthy-E",
+      "range": null,
+      "time": 0.44971369999984745
+    },
+    {
+      "name": "resume",
+      "range": null,
+      "time": 0.6234721000000718
+    },
+    {
+      "name": "range",
+      "range": "bytes=262144-",
+      "time": 0.6804513999995834
+    },
+    {
+      "name": "deferred",
+      "range": null,
+      "time": 0.7031800000004296
+    },
+    {
+      "name": "limited",
+      "range": null,
+      "time": 0.9389899999987392
+    },
+    {
+      "name": "slow",
+      "range": null,
+      "time": 2.0904450999987603
+    },
+    {
+      "name": "limited",
+      "range": null,
+      "time": 2.117435399999522
+    },
+    {
+      "name": "resume",
+      "range": "bytes=20971520-",
+      "time": 2.2373450999984925
+    },
+    {
+      "name": "document-A",
+      "range": null,
+      "time": 5.371908400000393
+    },
+    {
+      "name": "document-B",
+      "range": null,
+      "time": 5.391757499997766
+    },
+    {
+      "name": "document-C",
+      "range": null,
+      "time": 5.504240599999321
+    }
+  ],
+  "session_count": 5,
+  "errors": {
+    "500": 3
+  },
+  "goodput_bytes": 32241944,
+  "scheduler_sleep_seconds": 0.0
+}

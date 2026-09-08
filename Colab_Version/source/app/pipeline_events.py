@@ -106,7 +106,7 @@ class DownloadPresentation:
             row["state"] = event.get("state") or "MAKING_PROGRESS"
             row["last_progress_at"] = float(event.get("timestamp", time.time()) or time.time())
         elif kind == "success":
-            row["state"] = "COMPLETED"
+            row["state"] = event.get('state') or "COMPLETED"
         elif kind == "failure":
             row["state"] = event.get("state") or "FAILED_FOR_ROUND"
         elif str(row.get("state") or "") in {"DOWNLOADING", "MAKING_PROGRESS"}:

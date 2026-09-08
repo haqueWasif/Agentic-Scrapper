@@ -1,0 +1,2 @@
+# Optional PostgreSQL client only; normal Colab operation does not need it.
+psycopg[binary,pool]==3.3.5

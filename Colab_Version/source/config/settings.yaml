@@ -1,0 +1,26 @@
+network:
+  proxy_enabled: false
+  # Kept fixed for the lifetime of a scraping run.  Recovery rounds reuse
+  # this pool instead of creating one worker per failed document.
+  max_workers: 5
+  retry_limit: 5
+  retry_window_seconds: 1800
+  cooldown_enabled: true
+  new_download_min_seconds: 2
+  new_download_max_seconds: 6
+  # A request attempt is deliberately short; document-level recovery is
+  # handled by the queue after all documents in a round have been tried.
+  max_request_retries_per_attempt: 2
+  max_stall_seconds: 60
+  max_document_attempts: 5
+  recovery_round_delay_seconds: 5
+
+# These limits govern in-process producer/consumer handoff.  The current
+# Stage 1 producer is intentionally conservative; download jobs are bounded.
+pipeline:
+  stage1_queue_maxsize: 100
+  download_queue_maxsize: 50
+  stage2_queue_maxsize: 20
+
+validation:
+  max_workers: 2

@@ -1,0 +1,18 @@
+{
+  "unchanged_files": [
+    "app/agents/orchestrator.py",
+    "app/local_library.py",
+    "app/download_progress.py",
+    "colab/storage.py",
+    "app/pipeline_scheduler.py",
+    "config/settings.yaml"
+  ],
+  "root_matches_saved_optimized_snapshot": [
+    "app.py",
+    "app/network_manager.py",
+    "app/fair_download_queue.py",
+    "app/throughput.py"
+  ],
+  "previous_full_suite_error_names_match": true,
+  "benchmark_script_sha256": "3685c4d905cbf3b7e69500d42f48fb5651040afd7b494779fdada03c4aece44b"
+}

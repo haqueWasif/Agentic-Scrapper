@@ -68,6 +68,8 @@ def lifecycle_view(entry: dict[str, Any], *, status: str, candidate: dict[str, A
         "download": {
             **previous_download,
             "status": normalized,
+            "integrity_status": entry.get('integrity_status', 'UNKNOWN'),
+            "completed": normalized == 'COMPLETED' and bool(entry.get('completed')),
             "document_attempt": int(entry.get("document_attempt", previous_download.get("document_attempt", 0)) or 0),
             "bytes_downloaded": int(entry.get("bytes_downloaded", previous_download.get("bytes_downloaded", 0)) or 0),
             "part_path": entry.get("part_path", previous_download.get("part_path")),

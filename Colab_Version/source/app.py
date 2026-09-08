@@ -436,6 +436,8 @@ def _update_download_state(
     validation_status: str | None = None,
     technical_error_type: str | None = None,
     technical_error_message: str | None = None,
+    integrity_status: str | None = None,
+    integrity_file: Path | None = None,
 ) -> bool:
     """Atomically record transfer and round-recovery state for one document."""
     with _DOWNLOAD_STATE_LOCK:
@@ -445,6 +447,33 @@ def _update_download_state(
             state = _load_download_state()
             entry = state["downloads"].get(filename, {})
             _, destination, part_path = _download_paths(filename)
+            from app.download_integrity import file_signature, verified_download
+            strict = bool(getattr(globals().get('_NETWORK_SETTINGS'), 'scheduler_admission', False)
+                          or integrity_status is not None or entry.get('integrity_status')
+                          or status.upper() == 'INTEGRITY_PENDING')
+            if strict:
+                if integrity_status is not None:
+                    entry['integrity_status'] = integrity_status
+                    if integrity_status == 'VALID':
+                        entry['integrity_path'] = str(integrity_file or destination)
+                        entry['integrity_signature'] = file_signature(integrity_file or destination)
+                    else:
+                        entry.pop('integrity_signature', None)
+                if status.upper() in {'COMPLETED', 'INTEGRITY_PENDING'}:
+                    local_path = (candidate or entry.get('candidate') or {}).get('local_path')
+                    valid = (integrity_status == 'VALID' and entry.get('integrity_signature') is not None
+                             or verified_download(entry, local_path))
+                    invalid = str(entry.get('integrity_status','')).startswith('PDF_') and integrity_status is None
+                    status = entry['status'] if invalid else 'COMPLETED' if valid else 'INTEGRITY_PENDING'
+                    completed = bool(valid)
+                    if not valid and not invalid:
+                        entry['integrity_status'] = 'PENDING'
+                        for field in ('integrity_signature','content_sha256','duplicate_of'):
+                            entry.pop(field, None)
+                elif status.upper() == 'DOWNLOADING':
+                    entry['integrity_status'] = 'PENDING'
+                    for field in ('integrity_signature','content_sha256','duplicate_of'):
+                        entry.pop(field, None)
             current_size = int(size if size is not None else _download_size(filename))
             previous_size = int(entry.get("bytes_downloaded", entry.get("size", 0)) or 0)
             entry.update({
@@ -522,9 +551,40 @@ def _download_state_entry(filename: str) -> dict[str, Any] | None:
 
 def _completed_download_count(query: str | None = None) -> int:
     """Count durable finished PDFs once, including files created before the ledger existed."""
-    if not DOWNLOAD_DIRECTORY.exists() and query is None:
+    strict = getattr(globals().get('_NETWORK_SETTINGS'),'scheduler_admission',False)
+    if not strict:
+        with _DOWNLOAD_STATE_LOCK:
+            strict = any(isinstance(entry,dict) and entry.get('integrity_status')
+                         for entry in _load_download_state().get('downloads',{}).values())
+    if not DOWNLOAD_DIRECTORY.exists() and query is None and not strict:
         return 0
     paths = list(DOWNLOAD_DIRECTORY.glob("*.pdf"))
+    if strict:
+        from app.download_integrity import verified_download
+        # Atomic rename can precede the ledger write at process interruption.
+        # Reconcile those bytes as pending, never infer integrity from a suffix.
+        with _DOWNLOAD_STATE_LOCK:
+            with _download_state_process_lock() as acquired:
+                if not acquired:
+                    return 0
+                state = _load_download_state()
+                changed = False
+                for path in paths:
+                    entry = state['downloads'].setdefault(path.name, {'filename':path.name})
+                    if entry.get('status') == 'INTEGRITY_PENDING' and entry.get('integrity_status') == 'PENDING':
+                        continue
+                    if not verified_download(entry, path) and not str(entry.get('integrity_status','')).startswith('PDF_'):
+                        entry.update(status='INTEGRITY_PENDING',completed=False,integrity_status='PENDING',
+                                     size=path.stat().st_size,validation_status='PENDING')
+                        for field in ('integrity_signature','content_sha256','duplicate_of'):
+                            entry.pop(field, None)
+                        entry['lifecycle'] = lifecycle_view(entry,status='INTEGRITY_PENDING',validation_status='PENDING')
+                        changed = True
+                if changed:
+                    _save_download_state(state)
+                return sum(verified_download(entry) and (query is None or
+                    str((entry.get('candidate') or {}).get('query') or entry.get('query') or '') == query)
+                    for entry in state['downloads'].values() if isinstance(entry,dict))
     # Read and (when necessary) persist the ledger once.  Calling
     # ``_download_state_entry`` for every file repeatedly parsed the multi-MB
     # downloads.json file and dominated Streamlit's initial render time.
@@ -602,6 +662,11 @@ def _record_completed_content_hash(filename: str) -> dict[str, Any] | None:
     result to avoid a second extraction/LLM evaluation for byte-identical data.
     """
     _, destination, _ = _download_paths(filename)
+    from app.download_integrity import verified_download
+    strict = (getattr(globals().get('_NETWORK_SETTINGS'), 'scheduler_admission', False)
+              or (_download_state_entry(filename) or {}).get('integrity_status'))
+    if strict and not verified_download(_download_state_entry(filename), destination):
+        return None
     if not destination.exists():
         return None
     try:
@@ -624,7 +689,7 @@ def _record_completed_content_hash(filename: str) -> dict[str, Any] | None:
                 if other_filename == filename or not isinstance(other, dict):
                     continue
                 same_query = str((other.get("candidate") or {}).get("query") or other.get("query") or "") == str((entry.get("candidate") or {}).get("query") or entry.get("query") or "")
-                if same_query and other.get("content_sha256") == digest and str(other.get("status", "")).upper() == "COMPLETED":
+                if same_query and other.get("content_sha256") == digest and str(other.get("status", "")).upper() == "COMPLETED" and (not strict or verified_download(other)):
                     duplicate_of = str(other.get("document_id") or other_filename)
                     canonical_filename = other_filename
                     canonical_validation_status = str(other.get("validation_status") or "PENDING").upper()
@@ -701,6 +766,7 @@ def log_status(message: str, on_status=None) -> None:
 def download_file(direct_link, filename, referer_url, *, on_status=None, on_progress=None, network=None, worker_id=0, proxy=None):
     """Port of the proven baseline transfer loop; returns True or ``retry_next``."""
     from app.download_progress import METRICS, ProgressPolicy
+    from app.network_manager import RequestDeferred
     from time import perf_counter
     policy = getattr(network, "progress_policy", None) or ProgressPolicy()
     (on_status or logging.getLogger(__name__).info)(f"TRACE download_file ENTER: URL={direct_link}; filename={filename}")
@@ -716,11 +782,15 @@ def download_file(direct_link, filename, referer_url, *, on_status=None, on_prog
     state_updater = globals().get("_update_download_state")
 
     def record_state(status: str, reason: str | None = None) -> None:
+        if status.upper() == 'COMPLETED' and getattr(getattr(network,'settings',None),'scheduler_admission',False):
+            status = 'INTEGRITY_PENDING'
         if state_updater:
             state_updater(
                 filename, direct_link, status, size=_download_size(filename), reason=reason,
             )
 
+    if hasattr(network, 'before_request'):
+        network.before_request(direct_link, worker_id)
     record_state("partial" if part_file_path.exists() else "downloading")
     report(f"Filename: {filename}\nGateway attempted: {direct_link}")
     download_headers = {
@@ -863,6 +933,9 @@ def download_file(direct_link, filename, referer_url, *, on_status=None, on_prog
                         retry_after_seconds = 0
                     if hasattr(network, 'rate_limit'):
                         retry_after_seconds = network.rate_limit(direct_link, r)
+                        if network.settings.scheduler_admission:
+                            raise RequestDeferred(direct_link, time.time()+retry_after_seconds,
+                                                  'DEFERRED_RATE_LIMIT', f'HTTP 429 Retry-After={retry_after}')
                     report(
                         f"Gateway deferred:\nURL: {direct_link}\nReason: HTTP 429\n"
                         f"Action: respecting access policy; document will wait for the next recovery round"
@@ -982,6 +1055,8 @@ def download_file(direct_link, filename, referer_url, *, on_status=None, on_prog
                 f"Gateway: {urlparse(current_gateway).hostname or current_gateway}"
             )
             return True
+        except RequestDeferred:
+            raise  # Scheduler race/429, not a failed transfer or partial failure.
         except BaseException as exc:
             new_size = part_file_path.stat().st_size if part_file_path.exists() else 0
             record_state("partial" if new_size else "failed", f"{type(exc).__name__}: {exc}")
@@ -989,7 +1064,7 @@ def download_file(direct_link, filename, referer_url, *, on_status=None, on_prog
                 raise
             if network:
                 network.result(proxy, False)
-                network.gateway_result(direct_link)
+                network.gateway_result(direct_link, error=exc)
             temporary_failure = (
                 transfer_started or new_size > 0
                 or isinstance(exc, (ConnectionError, TimeoutError))
@@ -1043,6 +1118,7 @@ def _check_download_relevance(filename, on_status=None) -> bool:
 
 def parse_mirror_and_download(mirror_link, filename, needs_page_check=True, *, on_status=None, on_progress=None, _visited=None, _attempt_context=None, network=None, worker_id=0, proxy=None):
     """Port of the baseline mirror parser and alternative-gateway loop."""
+    from app.network_manager import RequestDeferred
     status_logger = globals().get("log_status")
     report = (
         (lambda message: status_logger(message, on_status))
@@ -1165,6 +1241,12 @@ def parse_mirror_and_download(mirror_link, filename, needs_page_check=True, *, o
                     impersonate="chrome120",
                     **(network.request_options(proxy) if network else {}),
                 )
+            except RequestDeferred:
+                raise
+            except Exception as exc:
+                if network:
+                    network.gateway_result(mirror_link, error=exc)
+                raise
             finally:
                 METRICS.add(mirror_resolution_seconds=perf_counter() - resolution_started)
             report(f"📡 Mirror response: HTTP {res.status_code} from {mirror_link}.")
@@ -1178,6 +1260,9 @@ def parse_mirror_and_download(mirror_link, filename, needs_page_check=True, *, o
                         retry_after = 0.0
                     if hasattr(network, 'rate_limit'):
                         retry_after = network.rate_limit(mirror_link, res)
+                        if network.settings.scheduler_admission:
+                            raise RequestDeferred(mirror_link,time.time()+retry_after,
+                                                  'DEFERRED_RATE_LIMIT','HTTP 429 on mirror page')
                     _update_download_state(
                         filename, mirror_link, "PARTIAL" if _download_size(filename) else "FAILED",
                         size=_download_size(filename), reason="HTTP 429 on mirror page",
@@ -1322,7 +1407,7 @@ def parse_mirror_and_download(mirror_link, filename, needs_page_check=True, *, o
             if not _check_download_relevance(filename, on_status):
                 return False
         return success
-    except InterruptedError:
+    except (InterruptedError, RequestDeferred):
         raise
     except Exception as exc:
         report(f"Filename: {filename}\nGateway attempted: {mirror_link}\nFailure reason: {type(exc).__name__}: {exc}")
@@ -1422,6 +1507,14 @@ def _bulk_candidates_from_page(
         _, destination, _ = _download_paths(filename)
         entry = _download_state_entry(filename)
         if destination.exists():
+            from app.download_integrity import verified_download
+            if (getattr(globals().get('_NETWORK_SETTINGS'),'scheduler_admission',False) or (entry or {}).get('integrity_status')) and not verified_download(entry,destination):
+                _update_download_state(filename, str(document.get('link') or ''), 'INTEGRITY_PENDING',
+                    candidate=dict(filename=filename,mirrors=_document_mirror_links(document,rows,search_url),
+                                   query=query,title=str(document.get('title') or '')),
+                    completed=False)
+                _schedule_validation(filename)
+                continue
             if not entry or str(entry.get("status", "")).upper() != "COMPLETED":
                 _update_download_state(filename, str(document.get("link") or ""), "completed", size=destination.stat().st_size)
             skipped_completed += 1
@@ -1528,6 +1621,12 @@ def _validate_pdf_stage2(
         store_validated_pdf(file_path, DATA_DIRECTORY, status == "APPROVED")
         if status in {"APPROVED", "REJECTED"} and source != "existing_pdf" else file_path
     )
+    if (stored_path != file_path and integrity['valid']
+            and (getattr(globals().get('_NETWORK_SETTINGS'),'scheduler_admission',False) or entry.get('integrity_status'))):
+        # Semantic storage relocation must not invalidate structural success,
+        # even if writing the semantic report subsequently fails or times out.
+        _update_download_state(file_path.name, '', 'COMPLETED', size=original_size,
+                               completed=True, integrity_status='VALID', integrity_file=stored_path)
     validation_report = {
         "filename": file_path.name,
         "query": query,
@@ -1568,13 +1667,54 @@ def _validate_pdf_stage2(
         f"Stage 2 {status.lower()}: {file_path.name} (score {validation_report['stage2_score']}) → {stored_path.name}"
     )
     if source == "new_download":
-        _update_download_state(
-            file_path.name, "", "COMPLETED", size=original_size,
-            reason=validation_report["reason"], completed=True, validation_status=status,
-            technical_error_type=validation.get("technical_error_type"),
-            technical_error_message=validation.get("technical_error_message"),
-        )
+        strict = bool(getattr(globals().get('_NETWORK_SETTINGS'),'scheduler_admission',False)
+                      or entry.get('integrity_status'))
+        if strict and not integrity['valid']:
+            _record_pdf_integrity(file_path.name, file_path, integrity)
+        else:
+            _update_download_state(
+                file_path.name, "", "COMPLETED", size=original_size,
+                reason=validation_report["reason"], completed=True, validation_status=status,
+                technical_error_type=validation.get("technical_error_type"),
+                technical_error_message=validation.get("technical_error_message"),
+                **({'integrity_status':'VALID','integrity_file':stored_path} if strict else {}),
+            )
     return validation_report
+
+
+def _record_pdf_integrity(filename: str, destination: Path, integrity: dict[str, Any]) -> bool:
+    """Commit structural validity, or retain recovery evidence. Validation pool only."""
+    if integrity['valid']:
+        return _update_download_state(filename, '', 'COMPLETED', size=destination.stat().st_size,
+            completed=True, integrity_status='VALID', integrity_file=destination, validation_status='PENDING')
+    _, managed, partial = _download_paths(filename)
+    entry = _download_state_entry(filename) or {}
+    candidate = dict(entry.get('candidate') or {})
+    error = integrity['error_type']
+    # Never alter an external existing library. Our own transferred file may
+    # become the authoritative partial; an existing .part is never overwritten.
+    if destination.absolute() == managed.absolute() and destination.exists():
+        if error == 'PDF_TRUNCATED' and not partial.exists():
+            if destination.is_symlink():
+                # Drive restore links finalized PDFs. A resumed writer must
+                # receive real local bytes, never append through a Drive link.
+                from colab.storage import copy_prefix
+                copy_prefix(destination, partial)
+                destination.unlink()
+            else:
+                os.replace(destination, partial)
+        else:
+            quarantine = DATA_DIRECTORY / 'integrity_failed'
+            quarantine.mkdir(parents=True, exist_ok=True)
+            target = quarantine / f'{filename}.{time.time_ns()}.invalid'
+            os.replace(destination, target)
+    candidate.pop('local_path', None)
+    _update_download_state(filename, '', 'PARTIAL' if partial.exists() else 'FAILED_FOR_ROUND',
+        size=partial.stat().st_size if partial.exists() else 0, completed=False,
+        candidate=candidate or None, integrity_status=error, validation_status='PENDING',
+        reason=f"{error}: {integrity['error_message']}", technical_error_type=error,
+        technical_error_message=integrity['error_message'])
+    return False
 
 
 def _run_validation_job(job: dict[str, Any], worker_id: int) -> None:
@@ -1588,15 +1728,43 @@ def _run_validation_job(job: dict[str, Any], worker_id: int) -> None:
     local_path = (entry.get("candidate") or {}).get("local_path")
     if local_path:
         destination = Path(local_path)
+    elif not destination.exists() and entry.get('integrity_path'):
+        destination = Path(entry['integrity_path'])
     if not destination.exists():
         return
+    if callable(event_emitter):
+        event_emitter("STAGE2_STARTED", candidate=event_candidate, filename=filename,
+                      message=f"Validation pool worker {worker_id} started {filename}")
+    strict = bool(getattr(globals().get('_NETWORK_SETTINGS'),'scheduler_admission',False)
+                  or entry.get('integrity_status'))
+    if strict:
+        from app.download_integrity import file_signature, verified_download
+        if not verified_download(entry, destination):
+            # No timer/error path may promote pending integrity to COMPLETED.
+            # Capture the identity of these bytes before parsing.
+            _update_download_state(filename, '', 'INTEGRITY_PENDING', completed=False,
+                                   validation_status='PENDING')
+            try:
+                signature = file_signature(destination)
+                integrity = check_pdf_integrity(destination)
+                if signature != file_signature(destination):
+                    if callable(event_emitter):
+                        event_emitter('STAGE2_PENDING',candidate=event_candidate,filename=filename)
+                    return  # Changed during validation; remains pending for restart.
+                if not _record_pdf_integrity(filename, destination, integrity):
+                    if callable(event_emitter):
+                        event_emitter('STAGE2_PENDING' if integrity['valid'] else 'STAGE2_INVALID',
+                                      candidate=event_candidate,filename=filename)
+                    return
+            except Exception as exc:
+                if callable(event_emitter):
+                    event_emitter('STAGE2_PENDING',candidate=event_candidate,filename=filename)
+                logging.getLogger(__name__).warning('Integrity pending for %s: %s', filename, type(exc).__name__)
+                return
     _update_download_state(
         filename, "", "COMPLETED", size=destination.stat().st_size,
         completed=True, validation_status="RUNNING",
     )
-    if callable(event_emitter):
-        event_emitter("STAGE2_STARTED", candidate=event_candidate, filename=filename,
-                       message=f"Stage 2 worker {worker_id} started {filename}")
     completed = threading.Event()
 
     def mark_pending_if_slow() -> None:
@@ -1640,9 +1808,12 @@ def _run_validation_job(job: dict[str, Any], worker_id: int) -> None:
                 )
             return
         validation = _validate_pdf_stage2(destination, "existing_pdf" if local_path else "new_download", stage1_score=stage1_score)
+        if strict and validation['status'] != 'PDF_INVALID' and (_download_state_entry(filename) or {}).get('validation_status') != validation['status']:
+            _update_download_state(filename, '', 'COMPLETED', completed=True, validation_status=validation['status'])
         if local_path:
-            _update_download_state(filename, "", "COMPLETED", size=destination.stat().st_size,
-                                   completed=True, validation_status=validation["status"])
+            if validation['status'] != 'PDF_INVALID':
+                _update_download_state(filename, "", "COMPLETED", size=destination.stat().st_size,
+                                       completed=True, validation_status=validation["status"])
         propagator = globals().get("_propagate_duplicate_validation")
         if callable(propagator):
             propagator(filename, str(validation.get("status") or "PENDING"))
@@ -1699,28 +1870,36 @@ def _schedule_validation(filename: str, *, stage1_score: int | None = 100) -> bo
     local_path = (existing.get("candidate") or {}).get("local_path")
     if local_path:
         destination = Path(local_path)
+    elif not destination.exists() and existing.get('integrity_path'):
+        destination = Path(existing['integrity_path'])
     if not destination.exists():
         return False
     existing = _download_state_entry(filename) or {}
     validation_status = str(existing.get("validation_status") or "").upper()
-    if validation_status in {"APPROVED", "REJECTED", "PDF_INVALID"}:
+    from app.download_integrity import verified_download
+    strict = bool(getattr(globals().get('_NETWORK_SETTINGS'),'scheduler_admission',False)
+                  or existing.get('integrity_status'))
+    if validation_status in {"APPROVED", "REJECTED", "PDF_INVALID"} and (not strict or verified_download(existing,destination)):
         return True
-    integrity = check_pdf_integrity(destination)
-    if not integrity["valid"]:
-        reason = f"{integrity['error_type']}: {integrity['error_message']}"
-        _update_download_state(
-            filename, "", "COMPLETED", size=int(integrity.get("size") or 0), completed=True,
-            validation_status="PDF_INVALID", reason=reason,
-            technical_error_type=integrity["error_type"], technical_error_message=integrity["error_message"],
-        )
-        event_emitter = globals().get("_emit_pipeline_event")
-        if callable(event_emitter):
-            event_emitter(
-                "STAGE2_INVALID", candidate={"run_id": str((existing.get("candidate") or {}).get("run_id") or "")},
-                filename=filename, message=reason,
+    # The same integrity gate runs inside _validate_pdf_stage2. Optimized
+    # downloads only enqueue here; CPU/Drive reads belong to the Stage 2 pool.
+    if not getattr(globals().get('_NETWORK_SETTINGS'), 'scheduler_admission', False):
+        integrity = check_pdf_integrity(destination)
+        if not integrity["valid"]:
+            reason = f"{integrity['error_type']}: {integrity['error_message']}"
+            _update_download_state(
+                filename, "", "COMPLETED", size=int(integrity.get("size") or 0), completed=True,
+                validation_status="PDF_INVALID", reason=reason,
+                technical_error_type=integrity["error_type"], technical_error_message=integrity["error_message"],
             )
-        logging.getLogger(__name__).warning("PDF integrity gate rejected %s: %s", filename, integrity["error_type"])
-        return False
+            event_emitter = globals().get("_emit_pipeline_event")
+            if callable(event_emitter):
+                event_emitter(
+                    "STAGE2_INVALID", candidate={"run_id": str((existing.get("candidate") or {}).get("run_id") or "")},
+                    filename=filename, message=reason,
+                )
+            logging.getLogger(__name__).warning("PDF integrity gate rejected %s: %s", filename, integrity["error_type"])
+            return False
     queue = _validation_queue()
     if queue.contains(filename):
         return True
@@ -1757,9 +1936,12 @@ def _restore_pending_validation_jobs(*, capacity_only: bool = False) -> int:
     for entry in entries:
         if capacity_only and entry.get("reason") != "Stage 2 queue is at configured capacity":
             continue
-        if str(entry.get("status", "")).upper() != "COMPLETED":
+        if str(entry.get("status", "")).upper() not in {"COMPLETED", "INTEGRITY_PENDING", "TRANSFER_COMPLETED"}:
             continue
-        if str(entry.get("validation_status") or "PENDING").upper() in {
+        from app.download_integrity import verified_download
+        pending_integrity = bool(getattr(globals().get('_NETWORK_SETTINGS'),'scheduler_admission',False)
+                                 or entry.get('integrity_status')) and not verified_download(entry)
+        if not pending_integrity and str(entry.get("validation_status") or "PENDING").upper() in {
             "APPROVED", "REJECTED", "DUPLICATE_PENDING", "PDF_INVALID",
         }:
             continue
@@ -1862,7 +2044,8 @@ def _recovery_candidates(
                     continue
                 status = str(entry.get("status", "")).upper()
                 candidate = entry.get("candidate")
-                if status not in {"QUEUED", "FAILED_FOR_ROUND", "RECOVERING", "PARTIAL", "FAILED"}:
+                if status not in {"QUEUED", "FAILED_FOR_ROUND", "RECOVERING", "PARTIAL", "FAILED", 'INTEGRITY_PENDING', 'TRANSFER_COMPLETED',
+                                  "HANDOFF_READY", "RECOVERY_READY", "DEFERRED_ROUTE", "DEFERRED_RATE_LIMIT"}:
                     if status != "DOWNLOADING":
                         continue
                 if not isinstance(candidate, dict) or not candidate.get("mirrors"):
@@ -1871,11 +2054,22 @@ def _recovery_candidates(
                     continue
                 _, destination, _ = _download_paths(filename)
                 if destination.exists():
-                    entry["status"] = "COMPLETED"
-                    entry["completed"] = True
+                    strict = getattr(globals().get('_NETWORK_SETTINGS'),'scheduler_admission',False) or entry.get('integrity_status')
+                    from app.download_integrity import verified_download
+                    valid = not strict or verified_download(entry, destination)
+                    entry["status"] = "COMPLETED" if valid else 'INTEGRITY_PENDING'
+                    entry["completed"] = valid
+                    if not valid:
+                        entry['integrity_status'] = 'PENDING'
+                        entry['validation_status'] = 'PENDING'
+                        entry['lifecycle'] = lifecycle_view(entry,status='INTEGRITY_PENDING',validation_status='PENDING')
                     entry["size"] = destination.stat().st_size
                     changed = True
                     continue
+                if status in {'INTEGRITY_PENDING','TRANSFER_COMPLETED'}:
+                    # A pending record with no finalized file cannot be restored
+                    # to validation. Existing partial bytes remain resumable.
+                    status = 'DOWNLOADING'
                 previous_attempt = max(1, int(entry.get("document_attempt", 0) or 0))
                 if previous_attempt > max_document_attempts:
                     entry["status"] = "PERMANENTLY_FAILED"
@@ -1906,6 +2100,9 @@ def _recovery_candidates(
                 job["filename"] = filename
                 job["_document_attempt"] = next_attempt
                 job["_retry_after_until"] = float(entry.get("retry_after_until", 0) or 0)
+                job['_not_before'] = max(float(job.get('_not_before',0) or 0),job['_retry_after_until'])
+                if status in {'HANDOFF_READY','RECOVERY_READY','DEFERRED_ROUTE','DEFERRED_RATE_LIMIT'}:
+                    job['_queue_state'] = status
                 recovered.append(job)
             if changed:
                 _save_download_state(state)
@@ -1914,6 +2111,7 @@ def _recovery_candidates(
 
 def _download_worker(candidate: dict[str, Any], network: NetworkManager, worker_id: int) -> dict[str, Any]:
     """Perform one bounded document-level attempt; never render Streamlit here."""
+    from app.network_manager import RequestDeferred, route_key
     filename = candidate["filename"]
     document_attempt = int(candidate.get("_document_attempt", 1) or 1)
     max_attempts = network.settings.max_document_attempts
@@ -1924,11 +2122,12 @@ def _download_worker(candidate: dict[str, Any], network: NetworkManager, worker_
         local_size = Path(candidate["local_path"]).stat().st_size
         if getattr(network, 'distributed', None):
             network.distributed.publish(candidate, Path(candidate['local_path']))
-        _update_download_state(filename, candidate.get("source_url", ""), "COMPLETED", size=local_size,
+        transfer_status = 'INTEGRITY_PENDING' if getattr(network.settings,'scheduler_admission',False) else 'COMPLETED'
+        _update_download_state(filename, candidate.get("source_url", ""), transfer_status, size=local_size,
                                candidate=state_candidate, completed=True, validation_status="PENDING")
         _schedule_validation(filename, stage1_score=candidate.get("stage1_score", 100))
         network.emit("success", worker_id, filename, "Reused existing local PDF; query validation queued",
-                     state="COMPLETED", bytes_downloaded=local_size, total_bytes=local_size)
+                     state=transfer_status, bytes_downloaded=local_size, total_bytes=local_size)
         if callable(event_emitter):
             event_emitter("LOCAL_PDF_REUSED", candidate=state_candidate, filename=filename)
         return {"success": True, "candidate": candidate, "attempt": document_attempt, "local_reused": True}
@@ -2055,8 +2254,9 @@ def _download_worker(candidate: dict[str, Any], network: NetworkManager, worker_
                 completed_size = _download_size(filename)
                 if getattr(network, 'distributed', None):
                     network.distributed.publish(candidate, _download_paths(filename)[1])
+                transfer_status = 'INTEGRITY_PENDING' if getattr(network.settings,'scheduler_admission',False) else 'COMPLETED'
                 _update_download_state(
-                    filename, candidate.get("source_url", ""), "COMPLETED", size=completed_size,
+                    filename, candidate.get("source_url", ""), transfer_status, size=completed_size,
                     candidate=state_candidate, document_attempt=document_attempt, completed=True,
                 )
                 scheduled = _schedule_validation(filename, stage1_score=candidate.get("stage1_score", 100))
@@ -2067,7 +2267,7 @@ def _download_worker(candidate: dict[str, Any], network: NetworkManager, worker_
                     "Downloaded successfully; Stage 2 PDF validation queued."
                     if scheduled else "Downloaded successfully; Stage 2 validation is pending queue capacity."
                 )
-                emit_network("success", validation_message, level="LIFECYCLE", state="COMPLETED",
+                emit_network("success", validation_message, level="LIFECYCLE", state=transfer_status,
                              bytes_downloaded=completed_size, total_bytes=completed_size,
                              short_message=f"✓ Worker {worker_id} completed PDF; Stage 2 {'queued' if scheduled else 'pending'}")
                 if callable(event_emitter):
@@ -2086,9 +2286,17 @@ def _download_worker(candidate: dict[str, Any], network: NetworkManager, worker_
                 network.cooldown(mirror_attempt)
             if defer_retries:
                 break
+    except RequestDeferred as exc:
+        return exc.outcome(candidate, _download_size(filename))
     except Exception as exc:
         last_reason = f"{type(exc).__name__}: {exc}"
 
+    if network.settings.scheduler_admission:
+        size = _download_size(filename)
+        return dict(success=False,candidate=candidate,attempt=document_attempt,permanent=False,
+                    retry_class='TRANSIENT_PARTIAL' if size else 'RECOVERY',reason=last_reason,
+                    part_size=size,downloaded_bytes=size,not_before=getattr(network.context,'not_before',0),
+                    route=route_key(getattr(network.context,'last_route','')))
     final_status = "PERMANENTLY_FAILED" if document_attempt >= max_attempts else "FAILED_FOR_ROUND"
     _update_download_state(
         filename, candidate.get("source_url", ""), final_status, size=_download_size(filename),
@@ -2249,10 +2457,15 @@ class _StreamlitDownloadCoordinator:
         if getattr(network.settings, 'scheduler_admission', False):
             from app.fair_download_queue import FairDownloadQueue
             def defer(job):
-                _update_download_state(job['filename'], job.get('source_url',''), 'RECOVERING',
+                saved = _update_download_state(job['filename'], job.get('source_url',''), job['_queue_state'],
                     size=_download_size(job['filename']), candidate=job,
                     document_attempt=job['_document_attempt'], reason=job['last_failure_reason'],
                     retry_after_seconds=max(0,job['_not_before']-time.time()))
+                if not saved:
+                    raise OSError('Could not persist scheduler state')
+                if job['_queue_state'] == 'PERMANENTLY_FAILED':
+                    _emit_pipeline_event('DOWNLOAD_PERMANENTLY_FAILED',candidate=job,filename=job['filename'],
+                                         message=job['last_failure_reason'],attempt=job['_document_attempt'])
             self.queue = FairDownloadQueue(worker, network=network, max_workers=network.settings.max_workers,
                 maxsize=network.settings.download_queue_maxsize, on_defer=defer)
         else:
@@ -2568,7 +2781,7 @@ async def run_scraping_pipeline(
         primary_jobs_queued = 0
         primary_failed_results: list[dict[str, Any]] = []
         queue_completions_seen = 0
-        recovery_backlog = GlobalRecoveryBacklog()
+        recovery_backlog = None if network.settings.scheduler_admission else GlobalRecoveryBacklog()
         restored_recovery_jobs = _recovery_candidates(
             query,
             max_document_attempts=network.settings.max_document_attempts,
@@ -2578,7 +2791,8 @@ async def run_scraping_pipeline(
             restored_recovery_jobs.extend(await asyncio.to_thread(distributed.recovery_jobs))
         for job in restored_recovery_jobs:
             job.setdefault("run_id", run_id)
-            recovery_backlog.add_restored(job)
+            if recovery_backlog is not None:
+                recovery_backlog.add_restored(job)
         scheduled_filenames.update(job["filename"] for job in restored_recovery_jobs)
         scheduled_document_ids.update(
             str(job.get("document_id") or stable_document_id(job))
@@ -2645,7 +2859,8 @@ async def run_scraping_pipeline(
                 presentation=coordinator.presentation,
                 queue_active=coordinator.queue.active,
                 queue_pending=coordinator.queue.pending,
-                recovery_jobs=list(coordinator.recovery_jobs.values()),
+                recovery_jobs=(coordinator.queue.recovery_snapshot() if hasattr(coordinator.queue,'recovery_snapshot')
+                               else list(coordinator.recovery_jobs.values())),
                 discovery_page=current_page_state["page"], max_pages=max_pages,
                 target_documents=target_documents,
                 max_document_attempts=network.settings.max_document_attempts,
@@ -2793,7 +3008,6 @@ async def run_scraping_pipeline(
             for job in restored_recovery_jobs:
                 job['_not_before'] = job.get('_retry_after_until', 0)
                 await coordinator.enqueue(job, recovery=True)
-            recovery_backlog = GlobalRecoveryBacklog()
         def collect_primary_outcomes() -> None:
             """Keep discovery productive while workers finish in the background."""
             nonlocal documents_downloaded, queue_completions_seen
@@ -2821,7 +3035,11 @@ async def run_scraping_pipeline(
                     refresh_live_metrics()
                     if network.telemetry:
                         from app.local_library import atomic_json
-                        stats = network.telemetry.snapshot(coordinator.queue.queue_stats() if hasattr(coordinator.queue,'queue_stats') else {})
+                        view = dashboard_snapshot()
+                        stats = network.telemetry.snapshot(
+                            coordinator.queue.queue_stats() if hasattr(coordinator.queue,'queue_stats') else {},
+                            pipeline=dict(stage2_active=view.stage2_active,stage2_queued=view.stage2_queued))
+                        stats['route_health'] = network.diagnostics()
                         globals()['_THROUGHPUT_SNAPSHOT'] = stats
                         if stats['elapsed_seconds'] - last_written >= 10:
                             await asyncio.to_thread(atomic_json, DATA_DIRECTORY / 'throughput.json', stats)
@@ -3133,13 +3351,23 @@ async def run_scraping_pipeline(
                             filename = f'{Path(filename).stem[:120]}-{suffix}.pdf'
                         _, destination, _ = _download_paths(filename)
                         if destination.exists() and local_match is None and not distributed:
-                            already_stored += 1
+                            from app.download_integrity import verified_download
+                            verified = verified_download(_download_state_entry(filename), destination)
+                            if network.settings.scheduler_admission and not verified:
+                                _update_download_state(filename, str(document.get('link') or ''), 'INTEGRITY_PENDING',
+                                    completed=False, candidate=dict(filename=filename, mirrors=mirror_links,
+                                    source_url=str(document.get('link') or ''), title=title, query=query.strip(),
+                                    document_id=candidate_identity, run_id=run_id))
+                                _schedule_validation(filename)
+                            else:
+                                already_stored += 1
                             current_page_state["stored"] = already_stored
                             for row in reversed(page_details):
                                 if row["Page"] == page_number and row["Item"] == document["id"]:
-                                    row.update({"Storage state": "Stored", "Action": "Skip"})
+                                    row.update({"Storage state": "Stored" if verified else 'Integrity pending',
+                                                "Action": "Skip" if verified else 'Validate local bytes'})
                                     break
-                            log(f"  📂 Already stored: {filename}; skipping download.")
+                            log(f"  📂 Local bytes retained: {filename}; {'integrity verified' if verified else 'integrity pending'}.")
                         elif filename in scheduled_filenames or candidate_identity in scheduled_document_ids:
                             recovery_retained += 1
                             current_page_state["recovery"] = recovery_retained
@@ -3213,13 +3441,14 @@ async def run_scraping_pipeline(
                 new_completions = coordinator.completed - queue_completions_seen
                 documents_downloaded += new_completions
                 queue_completions_seen = coordinator.completed
-                for result in primary_failed_results:
+                for result in (primary_failed_results if recovery_backlog is not None else []):
                     next_job, terminal = recovery_backlog.add_failed_attempt(
                         result, max_attempts=network.settings.max_document_attempts,
                     )
                     if terminal:
                         failed_urls.extend(dict(result.get("candidate") or {}).get("mirrors", []))
-                coordinator.set_recovery_backlog(recovery_backlog.snapshot())
+                if recovery_backlog is not None:
+                    coordinator.set_recovery_backlog(recovery_backlog.snapshot())
 
                 recovery_round = 1
                 while recovery_backlog:
@@ -3293,13 +3522,15 @@ async def run_scraping_pipeline(
             "candidates_discovered": live_metrics.discovered,
             "stage1_rejected": live_metrics.stage1_rejected,
             "new_pdfs_downloaded": coordinator.completed - coordinator.local_reused,
+            "downloaded_this_run": coordinator.completed - coordinator.local_reused,
+            "verified_pdfs_completed": _completed_download_count(query=query.strip()),
             "local_pdfs_reused": coordinator.local_reused,
             "download_failures": live_metrics.permanently_failed,
-            "recovery_remaining": len(recovery_backlog),
+            "recovery_remaining": len(recovery_backlog) if recovery_backlog is not None else coordinator.queue.pending,
             "pending_validation": stage2_totals["pending"],
             "rejected": stage2_totals["rejected"],
             "documents_approved": documents_approved,
-            "documents_downloaded": documents_downloaded,
+            "documents_downloaded": _completed_download_count(query=query.strip()) if network.settings.scheduler_admission else documents_downloaded,
             "stage2_approved": stage2_totals["new_download_approved"],
         }
     finally:
@@ -3319,6 +3550,7 @@ async def run_scraping_pipeline(
         if getattr(network, 'telemetry', None):
             from app.local_library import atomic_json
             globals()['_THROUGHPUT_SNAPSHOT'] = network.telemetry.snapshot()
+            globals()['_THROUGHPUT_SNAPSHOT']['route_health'] = network.diagnostics()
             atomic_json(DATA_DIRECTORY / 'throughput.json', globals()['_THROUGHPUT_SNAPSHOT'])
         network.close()
 
