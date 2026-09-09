@@ -98,7 +98,8 @@ The important design rule is:
 ```bash
 git clone https://github.com/haqueWasif/Agentic-Scrapper.git
 cd Agentic-Scrapper
-python -m venv .venv
+py -3.12 -m venv .venv
+.\.venv\Scripts\Activate.ps1
 ```
 
 Activate the environment for your platform, then install dependencies:
