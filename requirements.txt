@@ -8,7 +8,7 @@ pypdf>=4.0.0
 python-dotenv>=1.0.0
 
 # Shared foundations for API access, validation, and future LLM integration.
-langchain-openai>=0.2.0
+langchain-openai>=0.0.5
 langsmith>=0.1.0
 # CrewAI's OpenRouter provider uses LiteLLM.
 litellm
